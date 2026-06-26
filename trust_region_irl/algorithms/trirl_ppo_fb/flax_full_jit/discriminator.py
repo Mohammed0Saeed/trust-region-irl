@@ -46,7 +46,9 @@ class DiscriminatorFeatureBased(nn.Module):
             f : features
         """
         theta = self.param("theta", constant(0.001), (f.shape[-1],))
-        return jnp.dot(f, theta)
+        # return jnp.dot(f, theta)
+        r_max = 10.0
+        return r_max * jnp.tanh(jnp.dot(f, theta) / r_max)
 
 
 class BoltzmannDiscriminatorFeatureBased(nn.Module):
@@ -85,7 +87,9 @@ class BoltzmannDiscriminatorFeatureBased(nn.Module):
 
     def reward_only(self, f):
         z = self.encode_feature(f)
-        r = jnp.dot(z, self.theta)
+        # r = jnp.dot(z, self.theta)
+        r_max = 10.0
+        r = r_max * jnp.tanh(jnp.dot(z, self.theta) / r_max)
         return r
 
     def __call__(self, f, x, a, x_n, absorbing, shaping: float = 1.0):
@@ -97,5 +101,7 @@ class BoltzmannDiscriminatorFeatureBased(nn.Module):
         """
         zf = self.encode_feature(f)
         _ = self.energy_from_z(zf)
-        r = jnp.dot(zf, self.theta)
+        # r = jnp.dot(zf, self.theta)
+        r_max = 10.0
+        r = r_max * jnp.tanh(jnp.dot(zf, self.theta) / r_max)
         return r

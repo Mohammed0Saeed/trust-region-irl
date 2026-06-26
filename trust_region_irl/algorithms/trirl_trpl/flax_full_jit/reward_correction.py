@@ -45,7 +45,7 @@ def make_chunked_ensemble_rew_correct(
         eta_chunk:    (chunk_size, nr_steps, nr_envs)
         available:    scalar int (<= chunk_size) valid rows for the last (possibly short) chunk
         """
-        out_flat  = vmapped_chunk(inputs, params_chunk)c # (chunk_size, N, ...)
+        out_flat  = vmapped_chunk(inputs, params_chunk) # (chunk_size, N, ...)
         out_chunk = out_flat.reshape((chunk_size, nr_steps, nr_envs)) # (chunk_size, S, E)
 
         def body_fun(t, carry):

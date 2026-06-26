@@ -279,7 +279,7 @@ class TRIRL_PPO:
                         interpolated_abs = 0.0 * expert_absorbing # assume interpolated state to be non-absorbing
                         interpolated_feature = alpha * expert_feature + (1 - alpha) * feature                
                         grad_feature, grad_state, grad_action, grad_next_state = jax.grad(lambda f, s, a, sn, ab: jnp.sum(self.discriminator.apply(discriminator_params, f, s, a, sn, ab)), argnums=(0, 1, 2, 3))(interpolated_feature, interpolated_state, interpolated_action, interpolated_next_state, interpolated_abs)                
-                        grad_norm = jnp.sqrt(jnp.sum(jnp.square(grad_feature)))
+                        grad_norm = jnp.sqrt(jnp.sum(jnp.square(grad_feature) + 1e-2))
                         gp = (grad_norm - 1.0) ** 2
 
                         # Denoising Score Matching loss to get Boltzmann features

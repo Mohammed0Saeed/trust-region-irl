@@ -19,7 +19,7 @@ from trust_region_irl.algorithms.trirl_trpl.flax_full_jit.general_properties imp
 from trust_region_irl.algorithms.trirl_trpl.flax_full_jit.policy import get_policy
 from trust_region_irl.algorithms.trirl_trpl.flax_full_jit.critic import get_critic
 from trust_region_irl.algorithms.trirl_trpl.flax_full_jit.buffer import ParamsBuffer, EtasBuffer
-from trust_region_irl.algorithms.trirl_trpl.flax.discriminator import get_discriminator, get_reward_approximator
+from trust_region_irl.algorithms.trirl_trpl.flax_full_jit.discriminator import get_discriminator, get_reward_approximator
 from trust_region_irl.algorithms.data_utils import prepare_expert_data, expert_data_spec
 from trust_region_irl.algorithms.trirl_trpl.flax_full_jit.reward_correction import make_chunked_ensemble_rew_correct
 from trust_region_irl.algorithms.trirl_trpl.flax_full_jit.trust_region_layer import *

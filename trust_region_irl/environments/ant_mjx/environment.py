@@ -204,8 +204,8 @@ class Ant:
         min_z, max_z = self.healthy_z_range
         is_healthy = jnp.clip(
             jnp.nan_to_num(((torso_height > min_z) & (torso_height < max_z)).astype("float32")),
-            a_min=0.0,
-            a_max=1.0,
+            min=0.0,
+            max=1.0,
         )
         healthy_reward = jax.lax.cond(
             self.terminate_when_unhealthy,
