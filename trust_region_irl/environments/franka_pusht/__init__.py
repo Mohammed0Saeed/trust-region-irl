@@ -1,0 +1,8 @@
+from rl_x.environments.environment_manager import extract_environment_name_from_file, register_environment
+from trust_region_irl.environments.franka_pusht.create_env import create_train_and_eval_env
+from trust_region_irl.environments.franka_pusht.default_config import get_config
+from trust_region_irl.environments.franka_pusht.general_properties import GeneralProperties
+
+
+FRANKA_PUSHT = extract_environment_name_from_file(__file__)
+register_environment(FRANKA_PUSHT, get_config, create_train_and_eval_env, GeneralProperties)
