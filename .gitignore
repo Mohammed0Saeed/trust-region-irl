@@ -8,3 +8,4 @@ wandb/
 trirl_dataset/
 trust_region_irl/algorithms/trirl_discrete/outputs/
 /rl_x/
+/experiments/plots/

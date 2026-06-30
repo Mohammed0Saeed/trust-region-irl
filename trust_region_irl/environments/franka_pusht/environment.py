@@ -102,7 +102,7 @@ class FrankaPushT:
         self.mjx_data = mjx.make_data(self.mjx_model)
 
         # Original env used 1 substep x 5 intermediate steps per env step.
-        self.nr_intermediate_steps = 5
+        self.nr_intermediate_steps = 25
 
         # --- static indices (plain ints / numpy, resolved once) ---
         joint_ids = [self.mj_model.joint(n).id for n in _JOINT_NAMES]
@@ -352,6 +352,7 @@ class FrankaPushT:
         N = jnp.eye(7) - J_pinv @ J
         qnow = data.qpos[self._fr3_qadr]
         dq = dq + N @ (10.0 * (self._qhome - qnow))
+        jnp.clip(dq, self._dq_low, self._dq_high)
         return dq
 
     # ------------------------------------------------------------------
@@ -381,7 +382,13 @@ class FrankaPushT:
         ee_t3 = jnp.linalg.norm(data.sensordata[self._sadr_ee_t3:self._sadr_ee_t3 + 3])
         push_dist = ee_t1 + ee_t2 + ee_t3
 
-        cost = 30.0 * pos_dist + 3.0 * orn_dist + 0.005 * push_dist
+        # Constraint to keep the ee near the block always
+        d_min = 0.04
+        d_max = 0.13
+
+        zone_violation = jnp.maximum(0.0, d_min - push_dist) + jnp.maximum(0.0, push_dist - d_max)
+
+        cost = pos_dist + orn_dist + push_dist + zone_violation
         # Map NaN->0 and clamp infinities to a finite range, then clip the reward
         # so a single diverged env cannot produce ~1e38 returns that explode the
         # critic. REWARD_MIN bounds the worst per-step penalty.
@@ -542,6 +549,12 @@ class FrankaPushT:
         return mean_return
 
     def feature_from_transition(self, observation, action, eps=1e-6):
+        """
+        f1 = T Block to Goal
+        f2 = EE to Block
+        f3 = Orientation Err
+        Add a constraint ||EE - Block|| < e
+        """
         def feature_base(observation, action):
             observation = jnp.asarray(observation, dtype=jnp.float32)
             action = jnp.asarray(action, dtype=jnp.float32)

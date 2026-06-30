@@ -6,10 +6,10 @@
           jacobian="dense"
           integrator="implicitfast"
           cone="elliptic"
-          timestep="0.025" 
-          iterations="7"
-          ls_iterations="10">
-    <flag eulerdamp="disable" 
+          timestep="0.005"
+          iterations="10"
+          ls_iterations="15">
+    <flag eulerdamp="enable"
           warmstart="enable"/>
   </option>
 
