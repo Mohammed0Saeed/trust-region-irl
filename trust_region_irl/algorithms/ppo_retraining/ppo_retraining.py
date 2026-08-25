@@ -20,6 +20,17 @@ from rl_x.algorithms.ppo.flax_full_jit.critic import get_critic
 
 rlx_logger = logging.getLogger("rl_x")
 
+class Batch:
+    def __init__(self, states, next_states, actions, rewards, values, terminations, log_probs, advantages, returns):
+        self.states = states
+        self.next_states = next_states
+        self.actions = actions
+        self.rewards = rewards
+        self.values = values
+        self.terminations = terminations
+        self.log_probs = log_probs
+        self.advantages = advantages
+        self.returns = returns
 
 class PPO_RETRAINING:
     def __init__(self, config, train_env, eval_env, run_path, writer, reward_function=None):
@@ -68,9 +79,10 @@ class PPO_RETRAINING:
 
         if self.evaluation_and_save_frequency % self.batch_size != 0:
             raise ValueError("Evaluation and save frequency must be a multiple of batch size")
-        
+
         if self.nr_parallel_seeds > 1:
-            raise ValueError("Parallel seeds are not supported yet. This is mainly limited by not being able to log mutliple wandb runs at the same time.")
+            raise ValueError(
+                "Parallel seeds are not supported yet. This is mainly limited by not being able to log mutliple wandb runs at the same time.")
 
         rlx_logger.info(f"Using device: {jax.default_backend()}")
 
@@ -108,11 +120,12 @@ class PPO_RETRAINING:
         )
 
         if self.save_model:
-            os.makedirs(self.save_path)
+            os.makedirs(self.save_path, exist_ok=True)
             self.latest_model_file_name = "latest.model"
+            self.best_model_file_name = "best.model"
+            self.best_eval_return = -np.inf
             self.latest_model_checkpointer = orbax.checkpoint.PyTreeCheckpointer()
 
- 
     def train(self):
         def jitable_train_function(key, parallel_seed_id):
             key, reset_key = jax.random.split(key, 2)
@@ -122,7 +135,8 @@ class PPO_RETRAINING:
             policy_state = self.policy_state
             critic_state = self.critic_state
 
-            def multi_learning_and_eval_save_iteration(multi_learning_and_eval_save_iteration_carry, multi_learning_iteration_step):
+            def multi_learning_and_eval_save_iteration(multi_learning_and_eval_save_iteration_carry,
+                                                       multi_learning_iteration_step):
                 policy_state, critic_state, env_state, key = multi_learning_and_eval_save_iteration_carry
 
                 def learning_iteration(learning_iteration_carry, learning_iteration_step):
@@ -137,27 +151,29 @@ class PPO_RETRAINING:
                         action_mean, action_logstd = self.policy.apply(policy_state.params, observation)
                         action_std = jnp.exp(action_logstd)
                         action = action_mean + action_std * jax.random.normal(subkey, shape=action_mean.shape)
-                        log_prob = (-0.5 * ((action - action_mean) / action_std) ** 2 - 0.5 * jnp.log(2.0 * jnp.pi) - action_logstd).sum(1)
+                        log_prob = (-0.5 * ((action - action_mean) / action_std) ** 2 - 0.5 * jnp.log(
+                            2.0 * jnp.pi) - action_logstd).sum(1)
                         processed_action = self.get_processed_action(action)
                         value = self.critic.apply(critic_state.params, observation).squeeze(-1)
                         env_state = self.train_env.step(env_state, processed_action)
-                        transition = (observation, env_state.actual_next_observation, action, env_state.reward, value, env_state.terminated, log_prob, env_state.info)
+                        transition = (observation, env_state.actual_next_observation, action, env_state.reward, value,
+                                      env_state.terminated, log_prob, env_state.info)
 
                         if self.render:
                             def render(env_state):
                                 return self.train_env.render(env_state)
-                            
+
                             env_state = jax.experimental.io_callback(render, env_state, env_state)
 
                         return (policy_state, critic_state, env_state, key), transition
 
-                    single_rollout_carry, batch = jax.lax.scan(single_rollout, learning_iteration_carry, None, self.nr_steps)
+                    single_rollout_carry, batch = jax.lax.scan(single_rollout, learning_iteration_carry, None,
+                                                               self.nr_steps)
                     policy_state, critic_state, env_state, key = single_rollout_carry
                     states, next_states, actions, rewards, values, terminations, log_probs, infos = batch
 
                     # Use learnt reward
                     rewards = self.reward_function(states, actions, next_states, terminations, log_probs)
-
 
                     # Calculating advantages and returns
                     def calculate_gae_advantages(critic_state, next_states, rewards, values, terminations):
@@ -169,24 +185,26 @@ class PPO_RETRAINING:
                         next_values = self.critic.apply(critic_state.params, next_states).squeeze(-1)
                         delta = rewards + self.gamma * next_values * (1.0 - terminations) - values
                         init_advantages = delta[-1]
-                        _, advantages = jax.lax.scan(compute_advantages, (init_advantages,), jnp.arange(self.nr_steps - 2, -1, -1))
+                        _, advantages = jax.lax.scan(compute_advantages, (init_advantages,),
+                                                     jnp.arange(self.nr_steps - 2, -1, -1))
                         advantages = jnp.concatenate([advantages[::-1], jnp.array([init_advantages])])
                         returns = advantages + values
                         return advantages, returns
 
-                    advantages, returns = calculate_gae_advantages(critic_state, next_states, rewards, values, terminations)
-
+                    advantages, returns = calculate_gae_advantages(critic_state, next_states, rewards, values,
+                                                                   terminations)
 
                     # Optimizing
                     def loss_fn(policy_params, critic_params, state_b, action_b, log_prob_b, return_b, advantage_b):
                         # Policy loss
                         action_mean, action_logstd = self.policy.apply(policy_params, state_b)
                         action_std = jnp.exp(action_logstd)
-                        new_log_prob = -0.5 * ((action_b - action_mean) / action_std) ** 2 - 0.5 * jnp.log(2.0 * jnp.pi) - action_logstd
+                        new_log_prob = -0.5 * ((action_b - action_mean) / action_std) ** 2 - 0.5 * jnp.log(
+                            2.0 * jnp.pi) - action_logstd
                         new_log_prob = new_log_prob.sum(1)
                         entropy = action_logstd + 0.5 * jnp.log(2.0 * jnp.pi * jnp.e)
-                        entropy = self.entropy_coef * entropy # scaling to reduce critic loss (has no effect on solution since the same is also applied to the reward function)
-                        
+                        entropy = self.entropy_coef * entropy  # scaling to reduce critic loss (has no effect on solution since the same is also applied to the reward function)
+
                         logratio = new_log_prob - log_prob_b
                         ratio = jnp.exp(logratio)
                         approx_kl_div = (ratio - 1) - logratio
@@ -195,9 +213,9 @@ class PPO_RETRAINING:
                         pg_loss1 = -advantage_b * ratio
                         pg_loss2 = -advantage_b * jnp.clip(ratio, 1 - self.clip_range, 1 + self.clip_range)
                         pg_loss = jnp.maximum(pg_loss1, pg_loss2)
-                        
+
                         entropy_loss = entropy.sum(1)
-                        
+
                         # Critic loss
                         new_value = self.critic.apply(critic_params, state_b)
                         critic_loss = 0.5 * (new_value - return_b) ** 2
@@ -215,7 +233,6 @@ class PPO_RETRAINING:
                         }
 
                         return loss, (metrics)
-                    
 
                     batch_states = states.reshape((-1,) + self.os_shape)
                     batch_actions = actions.reshape((-1,) + self.as_shape)
@@ -237,7 +254,8 @@ class PPO_RETRAINING:
                         policy_state, critic_state = carry
 
                         minibatch_advantages = batch_advantages[minibatch_indices]
-                        minibatch_advantages = (minibatch_advantages - jnp.mean(minibatch_advantages)) / (jnp.std(minibatch_advantages) + 1e-8)
+                        minibatch_advantages = (minibatch_advantages - jnp.mean(minibatch_advantages)) / (
+                                    jnp.std(minibatch_advantages) + 1e-8)
 
                         (loss, (metrics)), (policy_gradients, critic_gradients) = grad_loss_fn(
                             policy_state.params,
@@ -258,15 +276,16 @@ class PPO_RETRAINING:
                         carry = (policy_state, critic_state)
 
                         return carry, (metrics)
-                    
+
                     init_carry = (policy_state, critic_state)
                     carry, (optimization_metrics) = jax.lax.scan(minibatch_update, init_carry, batch_indices)
                     policy_state, critic_state = carry
 
                     optimization_metrics["lr/learning_rate"] = policy_state.opt_state[1].hyperparams["learning_rate"]
-                    optimization_metrics["v_value/explained_variance"] = 1 - jnp.var(returns - values) / (jnp.var(returns) + 1e-8)
-                    optimization_metrics["policy/std_dev"] = jnp.mean(jnp.exp(policy_state.params["params"]["policy_logstd"]))
-
+                    optimization_metrics["v_value/explained_variance"] = 1 - jnp.var(returns - values) / (
+                                jnp.var(returns) + 1e-8)
+                    optimization_metrics["policy/std_dev"] = jnp.mean(
+                        jnp.exp(policy_state.params["params"]["policy_logstd"]))
 
                     # Logging
                     combined_metrics = {**infos, **optimization_metrics}
@@ -275,26 +294,33 @@ class PPO_RETRAINING:
                     def callback(carry):
                         metrics, learning_iteration_step, combined_learning_iteration_step, parallel_seed_id = carry
                         current_time = time.time()
-                        metrics["time/sps"] = int((self.nr_steps * self.nr_envs) / (current_time - self.last_time[parallel_seed_id]))
+                        metrics["time/sps"] = int(
+                            (self.nr_steps * self.nr_envs) / (current_time - self.last_time[parallel_seed_id]))
                         self.last_time[parallel_seed_id] = current_time
                         global_step = int(combined_learning_iteration_step.item() * self.nr_steps * self.nr_envs)
                         metrics["steps/nr_env_steps"] = global_step
-                        metrics["steps/nr_updates"] = combined_learning_iteration_step.item() * self.nr_epochs * self.nr_minibatches
-                        is_last_train_update_before_eval = self.evaluation_active and (learning_iteration_step + 1 == self.nr_updates_per_multi_learning_iteration)
+                        metrics[
+                            "steps/nr_updates"] = combined_learning_iteration_step.item() * self.nr_epochs * self.nr_minibatches
+                        is_last_train_update_before_eval = self.evaluation_active and (
+                                    learning_iteration_step + 1 == self.nr_updates_per_multi_learning_iteration)
                         self.start_logging(global_step)
                         for key, value in metrics.items():
                             self.log(f"{key}", np.asarray(value), global_step)
                         self.end_logging(wandb_commit=not is_last_train_update_before_eval)
 
-                    combined_learning_iteration_step = (multi_learning_iteration_step * self.nr_updates_per_multi_learning_iteration) + learning_iteration_step + 1
-                    jax.debug.callback(callback, (combined_metrics, learning_iteration_step, combined_learning_iteration_step, parallel_seed_id))
-                    
-                    return (policy_state, critic_state, env_state, key), None
-                    
-                key, subkey = jax.random.split(key)
-                learning_iteration_carry, _ = jax.lax.scan(learning_iteration, (policy_state, critic_state, env_state, subkey), jnp.arange(self.nr_updates_per_multi_learning_iteration))
-                policy_state, critic_state, env_state, key = learning_iteration_carry
+                    combined_learning_iteration_step = (
+                                                                   multi_learning_iteration_step * self.nr_updates_per_multi_learning_iteration) + learning_iteration_step + 1
+                    jax.debug.callback(callback,
+                                       (combined_metrics, learning_iteration_step, combined_learning_iteration_step,
+                                        parallel_seed_id))
 
+                    return (policy_state, critic_state, env_state, key), None
+
+                key, subkey = jax.random.split(key)
+                learning_iteration_carry, _ = jax.lax.scan(learning_iteration,
+                                                           (policy_state, critic_state, env_state, subkey),
+                                                           jnp.arange(self.nr_updates_per_multi_learning_iteration))
+                policy_state, critic_state, env_state, key = learning_iteration_carry
 
                 # Evaluating
                 if self.evaluation_active:
@@ -311,13 +337,17 @@ class PPO_RETRAINING:
                     key, reset_key = jax.random.split(key)
                     reset_keys = jax.random.split(reset_key, self.nr_envs)
                     eval_env_state = self.eval_env.reset(reset_keys, True)
-                    single_eval_rollout_carry, _ = jax.lax.scan(single_eval_rollout, (policy_state, eval_env_state), jnp.arange(self.horizon))
+                    single_eval_rollout_carry, _ = jax.lax.scan(single_eval_rollout, (policy_state, eval_env_state),
+                                                                jnp.arange(self.horizon))
                     _, eval_env_state = single_eval_rollout_carry
 
                     eval_metrics = {
                         "eval/episode_return": jnp.mean(eval_env_state.info["rollout/episode_return"]),
                         "eval/episode_length": jnp.mean(eval_env_state.info["rollout/episode_length"]),
                     }
+
+                    if "rollout/task_err" in eval_env_state.info:
+                        eval_metrics["eval/task_err"] = jnp.mean(eval_env_state.info["rollout/task_err"])
 
                     def callback(metrics_and_global_step):
                         metrics, combined_learning_iteration_step = metrics_and_global_step
@@ -327,21 +357,35 @@ class PPO_RETRAINING:
                             self.log(f"{key}", np.asarray(value), global_step)
                         self.end_logging()
 
-                    combined_learning_iteration_step = (multi_learning_iteration_step + 1) * self.nr_updates_per_multi_learning_iteration
+                    combined_learning_iteration_step = (
+                                                                   multi_learning_iteration_step + 1) * self.nr_updates_per_multi_learning_iteration
                     jax.debug.callback(callback, (eval_metrics, combined_learning_iteration_step))
-                
 
                 # Saving
                 if self.save_model:
-                    def save_with_check(policy_state, critic_state):
-                        self.save(policy_state, critic_state)
-                    jax.debug.callback(save_with_check, policy_state, critic_state)
+                    # Fetch episode_return from eval_metrics, fallback to -inf if not evaluating
+                    eval_return_for_save = (eval_metrics["eval/episode_return"]
+                                            if self.evaluation_active else jnp.asarray(-jnp.inf))
 
-                
+                    def save_with_check(policy_state, critic_state, eval_return):
+                        self.save(policy_state, critic_state)  # always save latest.model
+
+                        if self.evaluation_active:
+                            current_return = float(np.asarray(eval_return).reshape(-1)[0])
+
+                            # Check if the current return is GREATER than the best return
+                            if current_return > self.best_eval_return:
+                                self.best_eval_return = current_return
+                                self.save(policy_state, critic_state, file_name=self.best_model_file_name)
+                                rlx_logger.info(
+                                    f"[save-best] new best eval/episode_return={current_return:.4f} -> {self.best_model_file_name}")
+
+                    jax.debug.callback(save_with_check, policy_state, critic_state, eval_return_for_save)
+
                 return (policy_state, critic_state, env_state, key), None
 
-            jax.lax.scan(multi_learning_and_eval_save_iteration, (policy_state, critic_state, env_state, key), jnp.arange(self.nr_multi_learning_and_eval_save_iterations))
-            
+            jax.lax.scan(multi_learning_and_eval_save_iteration, (policy_state, critic_state, env_state, key),
+                         jnp.arange(self.nr_multi_learning_and_eval_save_iterations))
 
         self.key, subkey = jax.random.split(self.key)
         seed_keys = jax.random.split(subkey, self.nr_parallel_seeds)
@@ -350,7 +394,6 @@ class PPO_RETRAINING:
         self.start_time = deepcopy(self.last_time)
         jax.block_until_ready(train_function(seed_keys, jnp.arange(self.nr_parallel_seeds)))
         rlx_logger.info(f"Average time: {max([time.time() - t for t in self.start_time]):.2f} s")
-    
 
     def log(self, name, value, step):
         if self.track_tb:
@@ -360,11 +403,9 @@ class PPO_RETRAINING:
         if self.track_console:
             self.log_console(name, value)
 
-
     def log_console(self, name, value):
         value = np.format_float_positional(value, trim="-")
         rlx_logger.info(f"│ {name.ljust(30)}│ {str(value).ljust(14)[:14]} │", flush=False)
-
 
     def start_logging(self, step):
         if self.track_wandb:
@@ -374,30 +415,33 @@ class PPO_RETRAINING:
         else:
             rlx_logger.info(f"Step: {step}")
 
-
     def end_logging(self, wandb_commit=True):
         if self.track_wandb:
             wandb.log(self.wandb_log_cache, commit=wandb_commit)
         if self.track_console:
             rlx_logger.info("└" + "─" * 31 + "┴" + "─" * 16 + "┘")
 
-
-    def save(self, policy_state, critic_state):
+    def save(self, policy_state, critic_state, file_name=None):
+        file_name = file_name or self.latest_model_file_name
         checkpoint = {
             "policy": policy_state,
             "critic": critic_state
         }
         save_args = orbax_utils.save_args_from_target(checkpoint)
         self.latest_model_checkpointer.save(f"{self.save_path}/tmp", checkpoint, save_args=save_args)
+
         with open(f"{self.save_path}/tmp/config_algorithm.json", "w") as f:
             json.dump(self.config.algorithm.to_dict(), f)
-        shutil.make_archive(f"{self.save_path}/{self.latest_model_file_name}", "zip", f"{self.save_path}/tmp")
-        os.rename(f"{self.save_path}/{self.latest_model_file_name}.zip", f"{self.save_path}/{self.latest_model_file_name}")
+
+        # shutil.make_archive automatically appends '.zip' to the target file
+        shutil.make_archive(f"{self.save_path}/{file_name}", "zip", f"{self.save_path}/tmp")
+
+        # We REMOVED the os.rename line that was deleting the .zip extension
         shutil.rmtree(f"{self.save_path}/tmp")
 
         if self.track_wandb:
-            wandb.save(f"{self.save_path}/{self.latest_model_file_name}", base_path=self.save_path)
-    
+            # Note: Added .zip here so wandb uploads the correctly named archive
+            wandb.save(f"{self.save_path}/{file_name}.zip", base_path=self.save_path)
 
     def load(config, train_env, eval_env, run_path, writer, explicitly_set_algorithm_params):
         splitted_path = config.runner.load_model.split("/")
@@ -405,7 +449,7 @@ class PPO_RETRAINING:
         checkpoint_file_name = splitted_path[-1]
         shutil.unpack_archive(f"{checkpoint_dir}/{checkpoint_file_name}", f"{checkpoint_dir}/tmp", "zip")
         checkpoint_dir = f"{checkpoint_dir}/tmp"
-        
+
         loaded_algorithm_config = json.load(open(f"{checkpoint_dir}/config_algorithm.json", "r"))
         for key, value in loaded_algorithm_config.items():
             if f"algorithm.{key}" not in explicitly_set_algorithm_params and key in config.algorithm:
@@ -427,6 +471,98 @@ class PPO_RETRAINING:
 
         return model
 
+    def test(self, episodes):
+        self.test_ppo(episodes)
 
-    def general_properties():
+
+    def test_ppo(self, episodes):
+        def visualize():
+            rlx_logger.info("Testing runs infinitely. The episodes parameter is ignored.")
+
+            @jax.jit
+            def rollout(env_state, key):
+                # Use deterministic action mean for evaluation
+                action_mean, _ = self.policy.apply(self.policy_state.params, env_state.next_observation)
+                action = action_mean
+                processed_action = self.get_processed_action(action)
+                env_state = self.eval_env.step(env_state, processed_action)
+                return env_state, key
+
+            self.key, subkey = jax.random.split(self.key)
+            reset_keys = jax.random.split(subkey, self.nr_envs)
+            env_state = self.eval_env.reset(reset_keys, True)
+
+            while True:
+                env_state, self.key = rollout(env_state, self.key)
+                if self.render:
+                    env_state = self.eval_env.render(env_state)
+
+        def evaluate():
+            rlx_logger.info("Running and saving episodes.")
+            nr_steps = 1000
+            batch = Batch(
+                states=np.zeros((1, nr_steps, self.nr_envs) + self.os_shape),
+                next_states=np.zeros((1, nr_steps, self.nr_envs) + self.os_shape),
+                actions=np.zeros((1, nr_steps, self.nr_envs) + self.as_shape),
+                rewards=np.zeros((1, nr_steps, self.nr_envs)),
+                terminations=np.zeros((1, nr_steps, self.nr_envs)),
+
+                values=np.zeros((1, nr_steps, self.nr_envs)),
+                log_probs=np.zeros((1, nr_steps, self.nr_envs)),
+                advantages=np.zeros((1, nr_steps, self.nr_envs)),
+                returns=np.zeros((1, nr_steps, self.nr_envs)),
+            )
+
+            episode_return = jnp.zeros((self.nr_envs))
+            self.key, subkey = jax.random.split(self.key)
+            reset_keys = jax.random.split(subkey, self.nr_envs)
+            env_state = self.eval_env.reset(reset_keys, True)
+
+            for step in range(nr_steps):
+                batch.states[0, step] = env_state.next_observation
+
+                # step
+                action_mean, _ = self.policy.apply(self.policy_state.params, env_state.next_observation)
+                action = action_mean
+                processed_action = self.get_processed_action(action)
+                env_state = self.eval_env.step(env_state, processed_action)
+
+                batch.next_states[0, step] = env_state.actual_next_observation
+                batch.actions[0, step] = processed_action
+                batch.rewards[0, step] = env_state.reward
+                batch.terminations[0, step] = env_state.terminated
+                episode_return += env_state.reward
+
+                if self.render:
+                    env_state = self.eval_env.render(env_state)
+
+            mean_episode_return = episode_return.mean()
+            rlx_logger.info(f"Mean Episode Return: {mean_episode_return}")
+
+            def flatten_and_prune(arr):
+                flat = arr.reshape(-1, arr.shape[-1])
+                nan_mask = ~np.isnan(flat).any(axis=1)
+                return flat[nan_mask]
+
+            exp_states = flatten_and_prune(batch.states)
+            exp_actions = flatten_and_prune(batch.actions)
+            exp_next_states = flatten_and_prune(batch.next_states)
+            exp_absorbing = flatten_and_prune(batch.terminations).flatten()
+            exp_rewards = flatten_and_prune(batch.rewards).flatten()
+
+            print(f"save path: {self.save_path}")
+            print(f"states shape: {exp_states.shape}")
+            print(f"actions shape: {exp_actions.shape}")
+            print(f"rewards shape: {exp_rewards.shape}")
+            print(f"absorbing shape: {exp_absorbing.shape}")
+
+            os.makedirs(self.save_path, exist_ok=True)
+            np.savez(f"{self.save_path}/expert_dataset_PPO_retrained_{self.nr_envs}", states=exp_states,
+                     actions=exp_actions,
+                     next_states=exp_next_states, absorbing=exp_absorbing, rewards=exp_rewards)
+
+        visualize()
+        # evaluate() # Uncomment this line and comment visualize() if you want to generate the dataset instead
+
+    def general_properties(self):
         return GeneralProperties
