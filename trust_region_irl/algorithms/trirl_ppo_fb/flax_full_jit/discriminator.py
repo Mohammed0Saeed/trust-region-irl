@@ -54,9 +54,9 @@ class DiscriminatorFeatureBased(nn.Module):
         return jnp.dot(f, theta)
 
 
+# Leave this commented code because I need it for old policies learned on hard-coded boltzmann network
 # class BoltzmannDiscriminatorFeatureBased(nn.Module):
 #     def setup(self):
-#         # TODO: currently hard coded!
 #         hidden1 = 16
 #         hidden2 = 32
 #         hidden3 = 64
@@ -112,7 +112,7 @@ class DiscriminatorFeatureBased(nn.Module):
 
 
 class BoltzmannDiscriminatorFeatureBased(nn.Module):
-    hidden_dims: str = "16,32,64,128"
+    hidden_dims: str = "16,32,64"
     latent_dim: int = 16
     energy_hidden_dim: int = 32
 

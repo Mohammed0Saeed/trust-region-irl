@@ -301,7 +301,6 @@ class TRIRL_PPO:
                             agent_z = disc_encode_apply(discriminator_params, feature)
                             all_z = jnp.concatenate([expert_z, agent_z], axis=0)
 
-                            # TODO: figure out how to insert all features throughout the run
                             dsm_loss = expert_dsm_loss(discriminator_params, expert_feature, rng, sigma=self.dsm_sigma) # + expert_dsm_loss(discriminator_params, feature, rng, sigma=self.dsm_sigma)
                             var_loss = var_floor_penalty(all_z, target_std=self.feature_var_target)
                             feature_loss = dsm_loss + self.feature_var_weight * var_loss

@@ -18,7 +18,10 @@ from pathlib import Path
 import numpy as np
 import mujoco
 
-from trust_region_irl.environments.real_pusht_mjx.environment import PushT
+"""
+Add a transformation on the T block and goal block to place them correctly to the robot.
+"""
+from trust_region_irl.environments.pusht_mjx.environment import PushT
 
 
 def quat_mul(q1, q2):

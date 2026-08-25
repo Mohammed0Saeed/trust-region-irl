@@ -79,13 +79,6 @@ class PPO_RETRAINING_CURRICULUM:
         # Use the saved reward function
         self.reward_function = reward_function
 
-        # Upload the thetas
-        # try:
-        #     self.thetas = np.load("/theta_matrix.npy")
-        # except:
-        #     print(config.path)
-        #     print("Runtime Error: the thetas weren't found in the given path")
-
         # Determine the correct directory to look for theta_matrix.npy
         if hasattr(config.runner, "load_model") and config.runner.load_model:
             # Look in the folder of the model you are loading

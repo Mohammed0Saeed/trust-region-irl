@@ -143,6 +143,7 @@ def plot_rewards(exp_id, boltzmann_encoder, disc_params, theta):
     plt.tight_layout()
     plt.savefig(f"plots/reward_{exp_id}.png", dpi=300)
 
+# target_directory = 'runs/<PROJECT_NAME>/<EXPERIMENT_NAME>'
 target_directory = 'runs/data_scaling_effect/pusht_ppo_fb'
 
 exp_ids = [f.name for f in Path(target_directory).iterdir() if f.is_dir()]
