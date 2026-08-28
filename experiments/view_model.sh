@@ -8,7 +8,7 @@ python experiment.py \
       --environment.feature_fn="base_without_ctrl" \
       --environment.render=True \
       --runner.mode="test" \
-      --runner.load_model="runs/data_scaling_effect/pusht_ppo_fb/1787475765/models/best.model.zip" \
+      --runner.load_model="runs/different-boltzmann-design-base-features-ppo-fb/pusht_ppo_fb/1784559157/models/best.model.zip" \
       --runner.track_tb=False \
       --runner.track_wandb=False \
       --runner.save_model=False \

@@ -39,7 +39,7 @@ class PPO_RETRAINING:
         self.eval_env = eval_env
         self.writer = writer
 
-        self.save_model = config.runner.save_model
+        self.save_model = True
         self.save_path = os.path.join(run_path, "models")
         self.track_console = config.runner.track_console
         self.track_tb = config.runner.track_tb

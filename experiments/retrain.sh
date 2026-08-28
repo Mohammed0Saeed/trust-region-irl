@@ -28,11 +28,11 @@ python experiment.py \
    --environment.seed=0 \
    --environment.feature_fn="base_without_ctrl" \
    --runner.mode="test" \
-   --runner.load_model="runs/curriculum_rl_eval_based/pusht_ppo_fb/1785924800/models/best.model.zip" \
+   --runner.load_model="runs/different-boltzmann-design-base-features-ppo-fb/pusht_ppo_fb/1784559157/models/best.model.zip" \
    --runner.track_tb=False \
    --runner.track_console=True \
    --runner.track_wandb=False \
-   --runner.save_model=True \
+   --runner.save_model=False \
    --runner.wandb_entity="s-mohddheia-tu-darmstadt" \
-   --runner.project_name="PPO_retraining_curriculum" \
+   --runner.project_name="PPO_RETRAINING_EXP" \
    --runner.exp_name="pusht_ppo_retraining"

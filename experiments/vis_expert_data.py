@@ -69,7 +69,7 @@ def main():
             block_pos_world = np.asarray(env.goal_pos) + block_pos_rel
             block_quat_world = quat_mul(np.asarray(env.goal_quat), block_quat_rel)
 
-            data.qpos[0:3] = block_pos_world
+            data.qpos[0:3] = block_pos_world + np.array([0.0, 0.0, 0.0])
             data.qpos[3:7] = block_quat_world
             data.qpos[7:14] = arm_q
             mujoco.mj_forward(model, data)
