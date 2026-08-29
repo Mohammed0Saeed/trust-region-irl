@@ -7,8 +7,10 @@ python experiment.py \
   --environment.feature_fn="base_without_ctrl" \
   --environment.render=True \
   --runner.mode="test" \
-  --runner.load_model="runs/PPO_retraining/pusht_ppo_retraining/1785864253_ppo_retraining/models/best.model.zip" \
+  --runner.load_model="runs/PPO_RETRAINING_EXP/pusht_ppo_retraining/1787980369_ppo_retraining/models/latest.model.zip" \
   --runner.track_tb=False \
   --runner.track_wandb=False \
   --runner.save_model=False \
   --runner.track_console=True
+
+#

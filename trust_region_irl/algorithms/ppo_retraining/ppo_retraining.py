@@ -124,6 +124,7 @@ class PPO_RETRAINING:
             self.latest_model_file_name = "latest.model"
             self.best_model_file_name = "best.model"
             self.best_eval_return = -np.inf
+            self.best_eval_steps = self.train_env.horizon
             self.latest_model_checkpointer = orbax.checkpoint.PyTreeCheckpointer()
 
     def train(self):
@@ -366,12 +367,15 @@ class PPO_RETRAINING:
                     # Fetch episode_return from eval_metrics, fallback to -inf if not evaluating
                     eval_return_for_save = (eval_metrics["eval/episode_return"]
                                             if self.evaluation_active else jnp.asarray(-jnp.inf))
+                    eval_steps_for_save = (eval_metrics["eval/episode_length"]
+                                  if self.evaluation_active else jnp.asarray(-jnp.inf))
 
-                    def save_with_check(policy_state, critic_state, eval_return):
+                    def save_with_check(policy_state, critic_state, eval_return, eval_steps):
                         self.save(policy_state, critic_state)  # always save latest.model
 
                         if self.evaluation_active:
                             current_return = float(np.asarray(eval_return).reshape(-1)[0])
+                            current_steps = float(np.asarray(eval_steps).reshape(-1)[0])
 
                             # Check if the current return is GREATER than the best return
                             if current_return > self.best_eval_return:
@@ -379,8 +383,13 @@ class PPO_RETRAINING:
                                 self.save(policy_state, critic_state, file_name=self.best_model_file_name)
                                 rlx_logger.info(
                                     f"[save-best] new best eval/episode_return={current_return:.4f} -> {self.best_model_file_name}")
+                            if current_steps < self.best_eval_steps:
+                                self.best_eval_steps = current_steps
+                                self.save(policy_state, critic_state, file_name="fastest.model")
+                                rlx_logger.info(
+                                    f"[save-fast] new fast eval/episode_return={current_return:.4f} -> fastest.model")
 
-                    jax.debug.callback(save_with_check, policy_state, critic_state, eval_return_for_save)
+                    jax.debug.callback(save_with_check, policy_state, critic_state, eval_return_for_save, eval_steps_for_save)
 
                 return (policy_state, critic_state, env_state, key), None
 

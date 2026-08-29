@@ -77,8 +77,8 @@ def _quat_error_body(qd, q):
 
 class PushT:
     # fixed scene (examples/pusht_franka_free.py SEED 40 / the data generator)
-    BLOCK_POS = (0.6, -0.1) # (0.6, -0.1)
-    BLOCK_ANGLE = np.pi / 2
+    BLOCK_POS = (0.55, 0.0) # (0.6, -0.1)
+    BLOCK_ANGLE = 0 # np.pi / 2
     GOAL_POS_EE = np.array([0.45, 0.1, 0.035])
     GOAL_QUAT_EE = jnp.array([0.0, 0.7071, 0.7071, 0.0])  # wxyz
     MAX_SPEED = 0.35
@@ -92,6 +92,9 @@ class PushT:
     ERR_CLIP = 5.0        # cap pos/orient error (keeps reward finite/bounded)
     DIVERGE_BOUND = 1.0   # block farther than this (m) from goal -> end episode
                           # (~0.57 m table; 1.0 catches off-table blocks early)
+
+    # Singularity Threshold to truncate if the eigenvalue is lesser
+    SINGULARITY_THRESHOLD = 0.05
 
     def __init__(self, render, horizon=250, reward_style="dense",
                  success_threshold=0.05, feature_fn="base"):
@@ -239,7 +242,7 @@ class PushT:
         # clamp joint-velocity commands so a singular/extreme config can't drive
         # the arm (and free block) into MJX divergence (per-joint, at the actuator limits)
         dq = jnp.nan_to_num(dq, nan=0.0, posinf=0.0, neginf=0.0)
-        return jnp.clip(dq, -self.joint_vel_limits, self.joint_vel_limits)
+        return jnp.clip(dq, -self.joint_vel_limits, self.joint_vel_limits), J
 
     @partial(jax.vmap, in_axes=(None, 0, None))
     @partial(jax.jit, static_argnums=(0, 2))
@@ -296,11 +299,11 @@ class PushT:
         vel_xy = jnp.clip(action, -1.0, 1.0) * self.MAX_SPEED
 
         def substep(data, _):
-            dq = self._differential_ik(data, vel_xy)
+            dq, J = self._differential_ik(data, vel_xy)
             data = mjx.step(self.mjx_model, data.replace(ctrl=dq))
-            return data, None
+            return data, J
 
-        data, _ = jax.lax.scan(substep, state.data, xs=(), length=self.nr_intermediate_steps)
+        data, J = jax.lax.scan(substep, state.data, xs=(), length=self.nr_intermediate_steps)
 
         state.info_episode_store["episode_length"] += 1
         next_observation = self.get_observation(data)
@@ -314,7 +317,11 @@ class PushT:
         diverged = (jnp.nan_to_num(jnp.linalg.norm(block_pos_raw), nan=jnp.inf) > self.DIVERGE_BOUND) \
             | jnp.any(jnp.isnan(data.qpos)) | jnp.any(jnp.isnan(data.qvel))
         at_horizon = state.info_episode_store["episode_length"] >= self.horizon
-        truncated = at_horizon | diverged
+
+        singular_values = jnp.linalg.svd(J, compute_uv=False)
+        near_singular = jnp.min(singular_values) < self.SINGULARITY_THRESHOLD
+
+        truncated = at_horizon | diverged | near_singular
         done = terminated | truncated
 
         state.info.update(r_info)
