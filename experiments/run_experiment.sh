@@ -46,12 +46,12 @@ python experiment.py \
    --environment.name="pusht_mjx" \
    --environment.nr_envs=4096 \
    --environment.seed=0 \
-   --environment.feature_fn="base_without_ctrl" \
+   --environment.feature_fn="base_joints" \
    --runner.mode="train" \
    --runner.track_tb=True \
    --runner.track_console=True \
    --runner.track_wandb=True \
    --runner.save_model=True \
    --runner.wandb_entity="s-mohddheia-tu-darmstadt" \
-   --runner.project_name="data_scaling_effect" \
+   --runner.project_name="base_joints_features" \
    --runner.exp_name="pusht_ppo_fb"

@@ -77,8 +77,8 @@ def _quat_error_body(qd, q):
 
 class PushT:
     # fixed scene (examples/pusht_franka_free.py SEED 40 / the data generator)
-    BLOCK_POS = (0.55, 0.0) # (0.6, -0.1)
-    BLOCK_ANGLE = 0 # np.pi / 2
+    BLOCK_POS = (0.6, -0.1) #(0.6, -0.1)
+    BLOCK_ANGLE = np.pi / 2
     GOAL_POS_EE = np.array([0.45, 0.1, 0.035])
     GOAL_QUAT_EE = jnp.array([0.0, 0.7071, 0.7071, 0.0])  # wxyz
     MAX_SPEED = 0.35
@@ -222,27 +222,46 @@ class PushT:
         qhome and servo terms holding ee height/orientation. Port of the
         generator's differential_IK (deterministic_headless.py).
         """
+        SR_EPS = 1e-2  # singular-value threshold where damping kicks in
+        SR_LAMBDA_MAX = 0.1  # max damping (bigger = safer but laggier near singularities)
+        K_MANIP = 1.0  # null-space manipulability gain (tune)
+
         point = data.xpos[self.ee_body_id]
         jacp, jacr = mjx_support.jac(self.mjx_model, data, point, self.ee_body_id)  # (nv,3) each
-        J = jnp.concatenate([jacp.T, jacr.T], axis=0)        # (6, nv)
-        J = J[:, self.arm_dofadr]                            # (6, 7)
-        J_pinv = jnp.linalg.pinv(J)
+        J = jnp.concatenate([jacp.T, jacr.T], axis=0)  # (6, nv)
+        J = J[:, self.arm_dofadr]  # (6, 7)
 
-        ee_pos = data.xpos[self.ee_body_id]      # world ee position (kinematics)
-        ee_quat = data.xquat[self.ee_body_id]    # world ee orientation (kinematics)
-        goal_vec = _quat_error_body(self.GOAL_QUAT_EE, ee_quat)            # (3,)
+        # damping grows as the smallest singular value shrinks, so the gain stays bounded near singularities
+        sigma_min = jnp.linalg.svd(J, compute_uv=False)[-1]
+        lam2 = jnp.where(sigma_min < SR_EPS,
+                         (1.0 - (sigma_min / SR_EPS) ** 2) * SR_LAMBDA_MAX ** 2, 0.0)
+        J_dls = J.T @ jnp.linalg.solve(J @ J.T + lam2 * jnp.eye(6), jnp.eye(6))  # (7, 6) damped least-squares inverse
 
+        ee_pos = data.xpos[self.ee_body_id]  # world ee position (kinematics)
+        ee_quat = data.xquat[self.ee_body_id]  # world ee orientation (kinematics)
+        goal_vec = _quat_error_body(self.GOAL_QUAT_EE, ee_quat)  # (3,)
         temp = jnp.concatenate([vel_xy, jnp.array([self.Z_HOLD - ee_pos[2]])])
-        twist_err = jnp.concatenate([temp, goal_vec])                     # (6,)
-        dq = J_pinv @ twist_err
+        twist_err = jnp.concatenate([temp, goal_vec])  # (6,)
+        dq = J_dls @ twist_err
 
         qnow = data.qpos[self.arm_qadr]
-        N = jnp.eye(J.shape[1]) - J_pinv @ J
+        N = jnp.eye(J.shape[1]) - J_dls @ J  # projector built from the same damped inverse
         dq = dq + N @ (self.KP_ORI * (self.qhome - qnow))
-        # clamp joint-velocity commands so a singular/extreme config can't drive
-        # the arm (and free block) into MJX divergence (per-joint, at the actuator limits)
+
+        def _manip(q):  # Yoshikawa manipulability as a function of the arm joints, for autodiff
+            d = data.replace(qpos=data.qpos.at[self.arm_qadr].set(q))
+            d = mjx.kinematics(self.mjx_model, d)  # forward kinematics only, cheaper than full forward
+            jp, jr = mjx_support.jac(self.mjx_model, d, d.xpos[self.ee_body_id], self.ee_body_id)
+            Jq = jnp.concatenate([jp.T, jr.T], axis=0)[:, self.arm_dofadr]
+            return jnp.sqrt(jnp.linalg.det(Jq @ Jq.T) + 1e-12)
+
+        grad_w = jax.grad(_manip)(qnow)  # steers the redundant dof away from singular configs
+        dq = dq + N @ (K_MANIP * grad_w)  # applied in the null space so the ee motion is unaffected
+
         dq = jnp.nan_to_num(dq, nan=0.0, posinf=0.0, neginf=0.0)
-        return jnp.clip(dq, -self.joint_vel_limits, self.joint_vel_limits), J
+        # scale the whole vector by one factor so joint ratios (hence ee direction) are preserved under the velocity cap
+        scale = jnp.minimum(1.0, jnp.min(self.joint_vel_limits / (jnp.abs(dq) + 1e-9)))
+        return dq * scale
 
     @partial(jax.vmap, in_axes=(None, 0, None))
     @partial(jax.jit, static_argnums=(0, 2))
@@ -299,11 +318,11 @@ class PushT:
         vel_xy = jnp.clip(action, -1.0, 1.0) * self.MAX_SPEED
 
         def substep(data, _):
-            dq, J = self._differential_ik(data, vel_xy)
+            dq= self._differential_ik(data, vel_xy)
             data = mjx.step(self.mjx_model, data.replace(ctrl=dq))
-            return data, J
+            return data, None
 
-        data, J = jax.lax.scan(substep, state.data, xs=(), length=self.nr_intermediate_steps)
+        data, _ = jax.lax.scan(substep, state.data, xs=(), length=self.nr_intermediate_steps)
 
         state.info_episode_store["episode_length"] += 1
         next_observation = self.get_observation(data)
@@ -318,10 +337,7 @@ class PushT:
             | jnp.any(jnp.isnan(data.qpos)) | jnp.any(jnp.isnan(data.qvel))
         at_horizon = state.info_episode_store["episode_length"] >= self.horizon
 
-        singular_values = jnp.linalg.svd(J, compute_uv=False)
-        near_singular = jnp.min(singular_values) < self.SINGULARITY_THRESHOLD
-
-        truncated = at_horizon | diverged | near_singular
+        truncated = at_horizon | diverged
         done = terminated | truncated
 
         state.info.update(r_info)
@@ -467,6 +483,17 @@ class PushT:
             ee_block = jnp.linalg.norm(ee_rel - block_pos, axis=-1)  # ee-to-block dist (contact)
             ctrl = jnp.sum(jnp.square(action), axis=-1)
             features = jnp.stack([-pos_err, -orient_err, -ee_block, -ctrl], axis=-1)
+
+        elif self.feature_fn == "base_joints":
+            joints_pos = observation[:, 10:17]
+            block_pos = observation[:, 0:3]  # block pos rel goal
+            w = observation[:, 3]  # block quat w (rel goal)
+            ee_rel = observation[:, 7:10]  # ee pos rel goal
+            pos_err = jnp.linalg.norm(block_pos, axis=-1).reshape(-1, 1)
+            orient_err = (1.0 - jnp.clip(w * w, 0.0, 1.0)).reshape(-1, 1)  # sin^2(theta/2); 0 = aligned
+            ee_block = jnp.linalg.norm(ee_rel - block_pos, axis=-1).reshape(-1, 1)  # ee-to-block dist (contact)
+            features = jnp.concatenate([-pos_err, -orient_err, -ee_block, joints_pos], axis=-1)
+
         else:
             features = observation
 
