@@ -508,20 +508,9 @@ class PushT:
             ctrl = jnp.sum(jnp.square(action), axis=-1)
             features = jnp.stack([-pos_err, -orient_err, -ee_block, -ctrl], axis=-1)
 
-        elif self.feature_fn == "base_joints":
-            joints_pos = observation[:, 10:17]
-            block_pos = observation[:, 0:3]  # block pos rel goal
-            w = observation[:, 3]  # block quat w (rel goal)
-            ee_rel = observation[:, 7:10]  # ee pos rel goal
-            pos_err = jnp.linalg.norm(block_pos, axis=-1).reshape(-1, 1)
-            orient_err = (1.0 - jnp.clip(w * w, 0.0, 1.0)).reshape(-1, 1)  # sin^2(theta/2); 0 = aligned
-            ee_block = jnp.linalg.norm(ee_rel - block_pos, axis=-1).reshape(-1, 1)  # ee-to-block dist (contact)
-            features = jnp.concatenate([-pos_err, -orient_err, -ee_block, joints_pos], axis=-1)
-
         elif self.feature_fn == "pos_ort":
             block_pos = observation[:, 0:3]  # block pos rel goal
             w = observation[:, 3]  # block quat w (rel goal)
-            ee_rel = observation[:, 7:10]  # ee pos rel goal
             pos_err = jnp.linalg.norm(block_pos, axis=-1).reshape(-1, 1)
             orient_err = (1.0 - jnp.clip(w * w, 0.0, 1.0)).reshape(-1, 1)  # sin^2(theta/2); 0 = aligned
             features = jnp.concatenate([-pos_err, -orient_err], axis=-1)
