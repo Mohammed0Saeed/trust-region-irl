@@ -123,7 +123,7 @@ class TRIRL_PPO:
 
         def linear_schedule_disc(count):
             fraction = 1.0 - (count // (self.nr_minibatches * self.nr_epochs_disc)) / ((self.nr_updates * self.nr_epochs) / self.nr_epochs_disc)
-            return self.learning_rate * fraction
+            return self.learning_rate_disc * fraction
 
         learning_rate = linear_schedule if self.anneal_learning_rate else self.learning_rate
         learning_rate_disc = linear_schedule_disc if self.anneal_learning_rate else self.learning_rate_disc
@@ -312,23 +312,24 @@ class TRIRL_PPO:
                     batch_actions = actions.reshape((-1,) + self.as_shape)
                     batch_features = self.train_env.feature_from_transition(batch_states, batch_actions) # get features
 
-                    # Expert batch
+                    # Expert batch: sample batch_size transitions WITH REPLACEMENT so the
+                    # expert minibatch is correct even when batch_size > number of expert
+                    # transitions. (The original perm[:batch_size] returned only len(expert)
+                    # rows; the downstream arange(batch_size) indexing then clamped the
+                    # out-of-range indices to the last row, collapsing the expert batch to
+                    # ~one repeated sample whenever nr_envs*nr_steps > len(expert_data).)
                     key, shuffle_key = jax.random.split(key)
-                    perm = jax.random.permutation(shuffle_key, expert_states.shape[0])
-                    expert_states = expert_states[perm]
-                    expert_actions = expert_actions[perm]
-                    batch_expert_states = expert_states[:self.batch_size]
-                    batch_expert_actions = expert_actions[:self.batch_size]
+                    expert_idx = jax.random.randint(shuffle_key, (self.batch_size,), 0, expert_states.shape[0])
+                    batch_expert_states = expert_states[expert_idx]
+                    batch_expert_actions = expert_actions[expert_idx]
                     batch_expert_features = self.train_env.feature_from_transition(batch_expert_states, batch_expert_actions) # get features
                     expert_labels = jnp.ones((self.batch_size, 1), dtype=jnp.float32)
                     rollout_labels = jnp.zeros((self.batch_size, 1), dtype=jnp.float32)
 
                     batch_next_states = next_states.reshape((-1,) + self.os_shape)
                     batch_absorbing = terminations.reshape(-1)
-                    expert_next_states = expert_next_states[perm]
-                    expert_absorbing = expert_absorbing[perm]
-                    batch_expert_next_states = expert_next_states[:self.batch_size]
-                    batch_expert_absorbing = expert_absorbing[:self.batch_size]
+                    batch_expert_next_states = expert_next_states[expert_idx]
+                    batch_expert_absorbing = expert_absorbing[expert_idx]
 
                     vmap_trirl_loss_fn = jax.vmap(trirl_loss_fn, in_axes=(None, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), out_axes=0)
                     safe_mean = lambda x: jnp.mean(x) if x is not None else x
