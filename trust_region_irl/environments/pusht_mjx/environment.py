@@ -257,6 +257,7 @@ class PushT:
         def _manip(q):  # Yoshikawa manipulability as a function of the arm joints, for autodiff
             d = data.replace(qpos=data.qpos.at[self.arm_qadr].set(q))
             d = mjx.kinematics(self.mjx_model, d)  # forward kinematics only, cheaper than full forward
+            d = mjx.com_pos(self.mjx_model, d)
             jp, jr = mjx_support.jac(self.mjx_model, d, d.xpos[self.ee_body_id], self.ee_body_id)
             Jq = jnp.concatenate([jp.T, jr.T], axis=0)[:, self.arm_dofadr]
             return jnp.sqrt(jnp.linalg.det(Jq @ Jq.T) + 1e-12)
