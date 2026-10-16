@@ -76,15 +76,13 @@ def _quat_error_body(qd, q):
 
 
 class PushT:
-    # fixed scene (examples/pusht_franka_free.py SEED 40 / the data generator)
-    preset_block_poses = jnp.array([
-        [0.4, -0.1, np.pi / 2],
-        [0.65, 0.0, np.pi],
-        [0.6, 0.05, 5 * np.pi / 4],
-        [0.5, 0.2, -np.pi / 2],
-        [0.4, -0.05, -np.pi / 4],
-        [0.45, -0.15, 0.0],
-    ], dtype=jnp.float32)
+    # pre-calculated block poses and orientation that are randomly generated while not spawning in the same location as for the end-effector
+    preset_block_poses = jnp.array([[0.60, -0.10,  jnp.pi / 2],
+                                     [0.60,  0.10, -jnp.pi / 2],
+                                     [0.40, -0.10,  jnp.pi],
+                                     [0.62,  0.00,  jnp.pi],
+                                     [0.50, -0.15,  jnp.pi / 4],
+                                     [0.38,  0.00, -jnp.pi / 2]], dtype=jnp.float32)
 
     GOAL_POS_EE = np.array([0.45, 0.1, 0.035])
     GOAL_QUAT_EE = jnp.array([0.0, 0.7071, 0.7071, 0.0])  # wxyz
@@ -323,12 +321,6 @@ class PushT:
 
         next_observation = self.get_observation(data)
         info = dict(state.info)
-        info["env_info/pos_err"] = 0.0
-        info["env_info/orient_err"] = 0.0
-        info["env_info/is_success"] = 0.0
-        info["env_info/reward_dist"] = 0.0
-        info["env_info/reward_ctrl"] = 0.0
-        info["env_info/diverged"] = 0.0
         return state.replace(
             key=key,
             data=data,
