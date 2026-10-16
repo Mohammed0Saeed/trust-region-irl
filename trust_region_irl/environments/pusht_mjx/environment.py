@@ -348,15 +348,20 @@ class PushT:
 
         data, _ = jax.lax.scan(substep, state.data, xs=(), length=self.nr_intermediate_steps)
 
+        # after mjx.step, xpos/xquat still describe the pre-integration state; refresh
+        # them so obs/reward match the post-step qpos (as in the expert data). The IK
+        # keeps using the stale kinematics, like the generator's mj_step + sensordata.
+        obs_data = mjx.kinematics(self.mjx_model, data)
+
         state.info_episode_store["episode_length"] += 1
-        next_observation = self.get_observation(data)
-        reward, r_info = self.get_reward(data, action)
+        next_observation = self.get_observation(obs_data)
+        reward, r_info = self.get_reward(obs_data, action)
         terminated = r_info["env_info/is_success"] > 0.5
         # divergence guard: block left a sane region (huge-finite) or state went
         # NaN -> end the episode so it resets instead of accumulating garbage.
         # (NaN > bound is False, so explicit isnan checks are needed; qvel/xpos can
         #  go NaN a step before qpos, so cover qvel too.)
-        block_pos_raw = data.xpos[self.block_body_id] - self.goal_pos
+        block_pos_raw = obs_data.xpos[self.block_body_id] - self.goal_pos
         diverged = (jnp.nan_to_num(jnp.linalg.norm(block_pos_raw), nan=jnp.inf) > self.DIVERGE_BOUND) \
             | jnp.any(jnp.isnan(data.qpos)) | jnp.any(jnp.isnan(data.qvel))
         at_horizon = state.info_episode_store["episode_length"] >= self.horizon
@@ -475,7 +480,7 @@ class PushT:
             w = observation[:, 3]
             ee_rel = observation[:, 7:10]
             pos_err = jnp.linalg.norm(block_pos, axis=-1)
-            orient_err = 1.0 - jnp.clip(w * w, 0.0, 1.0)          # 0 aligned .. 1 at 90deg
+            orient_err = 1.0 - jnp.clip(w * w, 0.0, 1.0)          # sin^2(theta/2): 0 aligned, 0.5 at 90deg, 1 at 180deg
             ee_block = jnp.linalg.norm(ee_rel - block_pos, axis=-1)
             pos_bump_tight = jnp.exp(-(pos_err / 0.04) ** 2)      # ~1 only when essentially placed
             pos_bump_wide = jnp.exp(-(pos_err / 0.12) ** 2)
