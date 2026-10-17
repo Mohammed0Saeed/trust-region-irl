@@ -21,7 +21,7 @@ from trust_region_irl.algorithms.trirl_ppo_fb.flax_full_jit.general_properties i
 from trust_region_irl.algorithms.trirl_ppo_fb.flax_full_jit.policy import get_policy
 from trust_region_irl.algorithms.trirl_ppo_fb.flax_full_jit.critic import get_critic
 from trust_region_irl.algorithms.trirl_ppo_fb.flax_full_jit.discriminator import get_discriminator
-from trust_region_irl.algorithms.data_utils import prepare_expert_data, expert_data_spec
+from trust_region_irl.algorithms.trirl_ppo_fb.flax_full_jit.data_utils import prepare_expert_data, expert_data_spec
 
 rlx_logger = logging.getLogger("rl_x")
 
@@ -78,7 +78,6 @@ class TRIRL_PPO:
         self.os_shape = self.train_env.single_observation_space.shape
         self.as_shape = self.train_env.single_action_space.shape
         self.horizon = self.train_env.horizon
-        self.dim = np.prod(self.as_shape).item()
         self.retraining = config.algorithm.retraining
         self.init_eta = config.algorithm.init_eta
         self.const_eta = config.algorithm.const_eta
@@ -100,13 +99,16 @@ class TRIRL_PPO:
         self.gp_alpha = config.algorithm.gp_alpha
         self.beta = 1/config.algorithm.entropy_coef
         self.reward_type = config.algorithm.reward_type
-        self.num_data_samples = np.load(self.data_path)["states"].shape[0]
+        self.num_data_samples = prepare_expert_data(self.data_path)["states"].shape[0]
 
         # Curriculum Thetas
         # freq = self.nr_steps // N
         self.thetas = []
         self.theta_save_frequency = 1 # 1 for saving every theta collected
         self.curriculum_learning_mode = config.algorithm.curriculum_learning
+
+        if self.minibatch_size > self.batch_size:
+            raise ValueError("Minibatch size must not be larger than batch size")
 
         if self.evaluation_and_save_frequency % self.batch_size != 0:
             raise ValueError("Evaluation and save frequency must be a multiple of batch size")
@@ -129,8 +131,8 @@ class TRIRL_PPO:
             return self.learning_rate * fraction
 
         def linear_schedule_disc(count):
-            fraction = 1.0 - (count // (self.nr_minibatches * self.nr_epochs_disc)) / ((self.nr_updates * self.nr_epochs) / self.nr_epochs_disc)
-            return self.learning_rate * fraction
+            fraction = 1.0 - (count // (self.nr_minibatches * self.nr_epochs_disc)) / self.nr_updates
+            return self.learning_rate_disc * fraction
 
         learning_rate = linear_schedule if self.anneal_learning_rate else self.learning_rate
         learning_rate_disc = linear_schedule_disc if self.anneal_learning_rate else self.learning_rate_disc
@@ -352,6 +354,7 @@ class TRIRL_PPO:
                     key, subkey = jax.random.split(key)
                     batch_indices_disc = jnp.tile(jnp.arange(self.batch_size), (self.nr_epochs_disc, 1))
                     batch_indices_disc = jax.random.permutation(subkey, batch_indices_disc, axis=1, independent=True)
+                    batch_indices_disc = batch_indices_disc[:, :self.nr_minibatches * self.minibatch_size]
                     batch_indices_disc = batch_indices_disc.reshape((self.nr_epochs_disc * self.nr_minibatches, self.minibatch_size))
 
                     def trirl_minibatch_update(carry, minibatch_indices_disc):
@@ -408,6 +411,9 @@ class TRIRL_PPO:
                             + self.epsilon * self.beta * _get_log_density_ratio(_inputs_absorbing, discriminator_state).reshape(rewards.shape))
                     else:
                         corr_reward_absorbing_state = jnp.asarray(0.0)
+
+                    corr_reward = self.env_reward_frac * rewards + (1 - self.env_reward_frac) * corr_reward
+                    corr_reward_absorbing_state = (1 - self.env_reward_frac) * corr_reward_absorbing_state # the environment pays no reward in the absorbing state
 
 
                     """ PPO + KL Penalty """
@@ -533,6 +539,7 @@ class TRIRL_PPO:
                     key, subkey = jax.random.split(key)
                     batch_indices = jnp.tile(jnp.arange(self.batch_size), (self.nr_epochs, 1))
                     batch_indices = jax.random.permutation(subkey, batch_indices, axis=1, independent=True)
+                    batch_indices = batch_indices[:, :self.nr_minibatches * self.minibatch_size]
                     batch_indices = batch_indices.reshape((self.nr_epochs * self.nr_minibatches, self.minibatch_size))
 
                     def ppo_minibatch_update(carry, minibatch_indices):
@@ -777,7 +784,7 @@ class TRIRL_PPO:
         shutil.rmtree(f"{self.save_path}/tmp")
 
         if self.track_wandb:
-            wandb.save(f"{self.save_path}/{file_name}", base_path=self.save_path)
+            wandb.save(f"{self.save_path}/{file_name}.zip", base_path=self.save_path)
 
     def load(config, train_env, eval_env, run_path, writer, explicitly_set_algorithm_params):
         splitted_path = config.runner.load_model.split("/")

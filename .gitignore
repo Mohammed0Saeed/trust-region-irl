@@ -7,3 +7,7 @@ runs/
 wandb/
 trirl_dataset/
 trust_region_irl/algorithms/trirl_discrete/outputs/
+.idea
+trust_region_irl/environments/pusht_mjx/BUG_REPORT.txt
+bugs_report.txt
+experiments/run_experiment.sh
