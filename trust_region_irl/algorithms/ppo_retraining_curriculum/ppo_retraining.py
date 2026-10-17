@@ -18,7 +18,7 @@ from rl_x.algorithms.ppo.flax_full_jit.general_properties import GeneralProperti
 from rl_x.algorithms.ppo.flax_full_jit.policy import get_policy
 from rl_x.algorithms.ppo.flax_full_jit.critic import get_critic
 
-from trust_region_irl.algorithms.ppo_retraining import PPO_RETRAINING
+from trust_region_irl.algorithms.ppo_retraining.ppo_retraining import PPO_RETRAINING
 
 rlx_logger = logging.getLogger("rl_x")
 
