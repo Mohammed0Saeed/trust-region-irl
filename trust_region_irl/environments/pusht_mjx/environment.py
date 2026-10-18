@@ -467,10 +467,8 @@ class PushT:
         if self.reward_style == "sparse":
             reward = jnp.where(is_success > 0.5, 1.0, 0.0)
         else:
-            reward = reward_dist + 0.5 * reward_orient + 0.001 * reward_ctrl
-        # explicit bounded neginf (default is ~-3.4e38) so a future reward-sign
-        # change can't reintroduce a huge-negative leak into the critic
-        reward = jnp.nan_to_num(reward, nan=0.0, posinf=0.0, neginf=-10.0)
+            # reward = negated MTP expert cost
+            reward = -(30.0 * pos_err + 3.0 * orn_err + 0.005 * ee_block)
 
         info = {
             "env_info/pos_err": pos_err,
