@@ -495,58 +495,24 @@ class PushT:
         observation = jnp.asarray(observation, dtype=jnp.float32)
         action = jnp.asarray(action, dtype=jnp.float32)
         squeeze_output = observation.ndim == 1
+        block_pos = observation[:, 0:3]
+        w = observation[:, 3]
+        ee_rel = observation[:, 7:10]
+        pos_err = jnp.linalg.norm(block_pos, axis=-1)
+        orient_err = 1.0 - jnp.clip(w * w, 0.0, 1.0)  # sin^2(theta/2): 0 aligned, 0.5 at 90deg, 1 at 180deg
+        ee_block = jnp.linalg.norm(ee_rel - block_pos, axis=-1)
+
         if squeeze_output:
             observation = observation[None, :]
             action = action[None, :]
 
-        if self.feature_fn == "base_rbf":
-            # Engineered features that make matching the expert REQUIRE reaching the
-            # goal (not just matching its average distance). The broad "-err" terms
-            # pull toward the goal; the goal-centered Gaussian "bumps" are peaked at
-            # the goal -> high for the expert (which arrives) and ~0 for a policy
-            # parked partway, AND steep near the goal (a real finishing gradient).
-            block_pos = observation[:, 0:3]
-            w = observation[:, 3]
-            ee_rel = observation[:, 7:10]
-            pos_err = jnp.linalg.norm(block_pos, axis=-1)
-            orient_err = 1.0 - jnp.clip(w * w, 0.0, 1.0)          # sin^2(theta/2): 0 aligned, 0.5 at 90deg, 1 at 180deg
-            ee_block = jnp.linalg.norm(ee_rel - block_pos, axis=-1)
-            pos_bump_tight = jnp.exp(-(pos_err / 0.04) ** 2)      # ~1 only when essentially placed
-            pos_bump_wide = jnp.exp(-(pos_err / 0.12) ** 2)
-            ori_bump = jnp.exp(-(orient_err / 0.15) ** 2)
-            goal_bump = jnp.exp(-(((pos_err + orient_err)) / 0.10) ** 2)  # smooth success proxy
-            features = jnp.stack([-pos_err, -orient_err, -ee_block,
-                                  pos_bump_tight, pos_bump_wide, ori_bump, goal_bump], axis=-1)
-        elif self.feature_fn == "state_action":
+        if self.feature_fn == "state_action":
             features = jnp.concatenate([observation, action], axis=-1)
 
-        elif self.feature_fn == "base_without_ctrl":
-            block_pos = observation[:, 0:3]            # block pos rel goal
-            w = observation[:, 3]                      # block quat w (rel goal)
-            ee_rel = observation[:, 7:10]              # ee pos rel goal
-            pos_err = jnp.linalg.norm(block_pos, axis=-1)
-            orient_err = 1.0 - jnp.clip(w * w, 0.0, 1.0)        # sin^2(theta/2); 0 = aligned
-            ee_block = jnp.linalg.norm(ee_rel - block_pos, axis=-1)  # ee-to-block dist (contact)
+        elif self.feature_fn == "base":
             features = jnp.stack([-pos_err, -orient_err, -ee_block], axis=-1)
 
-        elif self.feature_fn == "base":
-            # Engineered, goal-relevant features so the LINEAR reward r=theta^T phi
-            # can express the task (a linear reward over raw block coords cannot).
-            # All are negative "rewards" (higher = better), mirroring point_maze.
-            block_pos = observation[:, 0:3]            # block pos rel goal
-            w = observation[:, 3]                      # block quat w (rel goal)
-            ee_rel = observation[:, 7:10]              # ee pos rel goal
-            pos_err = jnp.linalg.norm(block_pos, axis=-1)
-            orient_err = 1.0 - jnp.clip(w * w, 0.0, 1.0)        # sin^2(theta/2); 0 = aligned
-            ee_block = jnp.linalg.norm(ee_rel - block_pos, axis=-1)  # ee-to-block dist (contact)
-            ctrl = jnp.sum(jnp.square(action), axis=-1)
-            features = jnp.stack([-pos_err, -orient_err, -ee_block, -ctrl], axis=-1)
-
         elif self.feature_fn == "pos_ort":
-            block_pos = observation[:, 0:3]  # block pos rel goal
-            w = observation[:, 3]  # block quat w (rel goal)
-            pos_err = jnp.linalg.norm(block_pos, axis=-1).reshape(-1, 1)
-            orient_err = (1.0 - jnp.clip(w * w, 0.0, 1.0)).reshape(-1, 1)  # sin^2(theta/2); 0 = aligned
             features = jnp.concatenate([-pos_err, -orient_err], axis=-1)
         else:
             features = observation

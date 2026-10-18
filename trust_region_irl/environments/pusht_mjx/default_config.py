@@ -11,7 +11,7 @@ def get_config(environment_name):
     config.render = False
     config.device = "gpu"
     config.copy_train_env_for_eval = True
-    config.feature_fn = "base"  # IRL feature basis: base | base_rbf | base_without_ctrl | pos_ort | state_action
+    config.feature_fn = "base"  # IRL feature basis: base | pos_ort | state_action
     config.random_TPos = False
 
     return config
