@@ -220,6 +220,37 @@ class PushT:
         d.qpos[self._arm_qadr_np] = q
         return d.qpos.copy()
 
+        # ------------------------------------------------------------- dynamics #
+        # OLD DIFF_IK
+        def _differential_ik(self, data, vel_xy):
+            """Map a planar ee velocity (m/s) to 7 arm joint velocities.
+
+            Analytic body Jacobian + damped pinv, with a null-space pull toward
+            qhome and servo terms holding ee height/orientation. Port of the
+            generator's differential_IK (deterministic_headless.py).
+            """
+            point = data.xpos[self.ee_body_id]
+            jacp, jacr = mjx_support.jac(self.mjx_model, data, point, self.ee_body_id)  # (nv,3) each
+            J = jnp.concatenate([jacp.T, jacr.T], axis=0)  # (6, nv)
+            J = J[:, self.arm_dofadr]  # (6, 7)
+            J_pinv = jnp.linalg.pinv(J)
+
+            ee_pos = data.xpos[self.ee_body_id]  # world ee position (kinematics)
+            ee_quat = data.xquat[self.ee_body_id]  # world ee orientation (kinematics)
+            goal_vec = _quat_error_body(self.GOAL_QUAT_EE, ee_quat)  # (3,)
+
+            temp = jnp.concatenate([vel_xy, jnp.array([self.Z_HOLD - ee_pos[2]])])
+            twist_err = jnp.concatenate([temp, goal_vec])  # (6,)
+            dq = J_pinv @ twist_err
+
+            qnow = data.qpos[self.arm_qadr]
+            N = jnp.eye(J.shape[1]) - J_pinv @ J
+            dq = dq + N @ (self.KP_ORI * (self.qhome - qnow))
+            # clamp joint-velocity commands so a singular/extreme config can't drive
+            # the arm (and free block) into MJX divergence (per-joint, at the actuator limits)
+            dq = jnp.nan_to_num(dq, nan=0.0, posinf=0.0, neginf=0.0)
+            return jnp.clip(dq, -self.joint_vel_limits, self.joint_vel_limits)
+
     # ------------------------------------------------------------- dynamics #
     def _differential_ik(self, data, vel_xy):
         """Map a planar ee velocity (m/s) to 7 arm joint velocities.

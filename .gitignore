@@ -7,3 +7,6 @@ runs/
 wandb/
 trirl_dataset/
 trust_region_irl/algorithms/trirl_discrete/outputs/
+experiments/evaluate_model.py
+experiments/view_model.sh
+experiments/vis_expert_data.py
