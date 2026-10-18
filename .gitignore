@@ -11,3 +11,8 @@ trust_region_irl/algorithms/trirl_discrete/outputs/
 trust_region_irl/environments/pusht_mjx/BUG_REPORT.txt
 bugs_report.txt
 experiments/run_experiment.sh
+experiments/vis_expert_data.py
+experiments/plot_reward.py
+experiments/view_model.sh
+experiments/evaluate_model.py
+experiments/evaluations/

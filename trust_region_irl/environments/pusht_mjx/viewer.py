@@ -5,9 +5,13 @@ from itertools import cycle
 
 
 class MujocoViewer:
-    def __init__(self, model, dt):
+    def __init__(self, model, dt, nr_presets=0):
         self.model = model
         self.dt = dt
+        # Block preset selected with R / number keys. None means the env decides (default or random_TPos).
+        self.nr_presets = nr_presets
+        self.preset = None
+        self.preset_changed = False
 
         self.button_left, self.button_right, self.button_middle = False, False, False
         self.last_x, self.last_y = 0, 0
@@ -97,6 +101,15 @@ class MujocoViewer:
             self.run_speed_factor /= 2.0
         elif key == glfw.KEY_F:
             self.run_speed_factor *= 2.0
+        elif key == glfw.KEY_R and self.nr_presets > 0:
+            self.preset = 0 if self.preset is None else (self.preset + 1) % self.nr_presets
+            self.preset_changed = True
+        elif glfw.KEY_1 <= key <= glfw.KEY_9 and key - glfw.KEY_1 < self.nr_presets:
+            self.preset = key - glfw.KEY_1
+            self.preset_changed = True
+        elif key == glfw.KEY_0 and self.nr_presets > 0:
+            self.preset = None
+            self.preset_changed = True
 
 
     def scroll(self, window, x_offset, y_offset):
@@ -167,6 +180,9 @@ class MujocoViewer:
         self.overlay[topleft][1] += "\n"
         self.overlay[topleft][0] += "Camera mode:\n"
         self.overlay[topleft][1] += self.camera_mode+"\n"
+        if self.nr_presets > 0:
+            self.overlay[topleft][0] += "Block preset ([R] next, [1-%d] pick, [0] env default):\n" % self.nr_presets
+            self.overlay[topleft][1] += ("env default" if self.preset is None else "%d / %d" % (self.preset + 1, self.nr_presets)) + "\n"
         self.overlay[topleft][0] += "Run speed = %.3f x real time" % self.run_speed_factor
         self.overlay[topleft][1] += "[S]lower, [F]aster"
 

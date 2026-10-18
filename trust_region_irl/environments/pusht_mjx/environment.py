@@ -172,7 +172,7 @@ class PushT:
         self.viewer = None
         if render:
             dt = self.mj_model.opt.timestep * self.nr_intermediate_steps
-            self.viewer = MujocoViewer(self.mj_model, dt)
+            self.viewer = MujocoViewer(self.mj_model, dt, nr_presets=len(self.preset_block_poses))
             c_model = deepcopy(self.mj_model)
             c_data = mujoco.MjData(c_model)
             mujoco.mj_step(c_model, c_data, 1)
@@ -290,12 +290,20 @@ class PushT:
                       info, info_episode_store, key)
         return self._reset(state)
 
+    @partial(jax.vmap, in_axes=(None, 0, None))
     @partial(jax.jit, static_argnums=(0,))
-    def _reset(self, state):
-        if self.random_TPos:
-            key, t_pos_key = jax.random.split(state.key, 2)
+    def reset_to_preset(self, state, preset_idx):
+        """Reset every env to block preset `preset_idx`, keeping the state's pytree structure (used by render)."""
+        return self._reset(state, preset_idx)
 
-            idx = jax.random.randint(t_pos_key, shape=(), minval=0, maxval=6)
+    @partial(jax.jit, static_argnums=(0,))
+    def _reset(self, state, preset_idx=None):
+        if preset_idx is not None or self.random_TPos:
+            key = state.key
+            if preset_idx is None:
+                key, t_pos_key = jax.random.split(state.key, 2)
+                preset_idx = jax.random.randint(t_pos_key, shape=(), minval=0, maxval=6)
+            idx = preset_idx
 
             block_xy = self.preset_block_poses[idx][0:2]
             block_angle = self.preset_block_poses[idx][2]
@@ -451,6 +459,13 @@ class PushT:
         return reward, info
 
     def render(self, state):
+        # Apply a block preset picked in the viewer, and re-apply it whenever an episode auto-resets.
+        preset = self.viewer.preset
+        new_episode = int(np.asarray(state.info_episode_store["episode_length"])[0]) == 0
+        if self.viewer.preset_changed or (preset is not None and new_episode):
+            self.viewer.preset_changed = False
+            # None falls back to the env's own choice (random preset if random_TPos, else the default pose)
+            state = self.reset_to_preset(state, None if preset is None else jnp.int32(preset))
         env_id = 0
         data = mjx.get_data(self.mj_model, state.data)[env_id]
         data.light_xdir = self.light_xdir
