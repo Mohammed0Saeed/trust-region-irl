@@ -102,7 +102,7 @@ class PushT:
     SINGULARITY_THRESHOLD = 0.05
 
     def __init__(self, render, horizon=250, reward_style="dense",
-                 success_threshold=0.05, feature_fn="base", random_TPos = False):
+                 success_threshold=0.15, feature_fn="base", random_TPos = False):
         self.random_TPos = random_TPos
         self.horizon = horizon
         self.reward_style = reward_style

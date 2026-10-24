@@ -17,11 +17,11 @@ import wandb
 import re
 
 from trust_region_irl.algorithms.ppo_retraining_curriculum import PPO_RETRAINING_CURRICULUM
-from trust_region_irl.algorithms.trirl_ppo_fb.flax_full_jit.general_properties import GeneralProperties
-from trust_region_irl.algorithms.trirl_ppo_fb.flax_full_jit.policy import get_policy
-from trust_region_irl.algorithms.trirl_ppo_fb.flax_full_jit.critic import get_critic
-from trust_region_irl.algorithms.trirl_ppo_fb.flax_full_jit.discriminator import get_discriminator
-from trust_region_irl.algorithms.trirl_ppo_fb.flax_full_jit.data_utils import prepare_expert_data, expert_data_spec
+from trust_region_irl.algorithms.trirl_ppo_byol.flax_full_jit.general_properties import GeneralProperties
+from trust_region_irl.algorithms.trirl_ppo_byol.flax_full_jit.policy import get_policy
+from trust_region_irl.algorithms.trirl_ppo_byol.flax_full_jit.critic import get_critic
+from trust_region_irl.algorithms.trirl_ppo_byol.flax_full_jit.discriminator import get_discriminator
+from trust_region_irl.algorithms.trirl_ppo_byol.flax_full_jit.data_utils import prepare_expert_data, expert_data_spec
 
 rlx_logger = logging.getLogger("rl_x")
 
