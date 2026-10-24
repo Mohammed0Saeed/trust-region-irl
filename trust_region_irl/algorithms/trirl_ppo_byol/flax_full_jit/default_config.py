@@ -48,7 +48,7 @@ def get_config(algorithm_name):
     config.learning_rate_byol = 1e-3
     config.byol_tau = 0.99
     config.byol_noise_scale = 0.05
-    config.nr_epochs_byol = 1
+    config.nr_epochs_byol = 1  # number of full-rollout-batch BYOL steps per TRIRL iteration (online step + EMA each)
 
     config.handle_absorbing_states = True
     config.reward_type = 'feature-based'

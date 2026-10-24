@@ -163,7 +163,8 @@ class TRIRL_PPO:
                 optax.inject_hyperparams(optax.adam)(learning_rate=self.learning_rate_byol),
             )
         )
-        self.byol_target_params = self.byol.init(target_byol_key, env_state.next_observation)
+        # BYOL: the target network starts as an exact copy of the online network and then follows it by EMA
+        self.byol_target_params = jax.tree_util.tree_map(jnp.copy, byol_params)
         feature = self.byol.apply(self.byol_state.params, env_state.next_observation, method=self.byol.encode)
 
         self.policy_state = TrainState.create(
@@ -217,7 +218,6 @@ class TRIRL_PPO:
             expert_next_states = demonstrations["next_states"]
             expert_actions = demonstrations["actions"]
             expert_absorbing = demonstrations["absorbing"].flatten()
-            expert_features = self.train_env.feature_from_transition(expert_states, expert_actions)
 
             # Set up carry objects
             policy_state = self.policy_state
@@ -229,12 +229,12 @@ class TRIRL_PPO:
 
             def multi_learning_and_eval_save_iteration(multi_learning_and_eval_save_iteration_carry, multi_learning_iteration_step):
                 policy_state, critic_state, discriminator_state, corrected_reward_state, \
-                (expert_states, expert_actions, expert_next_states, expert_absorbing, expert_features), \
+                (expert_states, expert_actions, expert_next_states, expert_absorbing), \
                 env_state, byol_state, byol_target_params, key = multi_learning_and_eval_save_iteration_carry
 
                 def learning_iteration(learning_iteration_carry, learning_iteration_step):
                     policy_state, critic_state, discriminator_state, corrected_reward_state, \
-                    (expert_states, expert_actions, expert_next_states, expert_absorbing, expert_features), \
+                    (expert_states, expert_actions, expert_next_states, expert_absorbing), \
                     env_state, byol_state, byol_target_params, key = learning_iteration_carry
 
                         # Acting
@@ -267,7 +267,7 @@ class TRIRL_PPO:
 
                     """ BYOL UPDATE """
 
-                    def augment_state(x, rng_key, noise_scale=0.05):
+                    def augment_state(x, rng_key):
                         return x + self.byol_noise_scale * jax.random.normal(rng_key, shape=x.shape)
 
                     def byol_loss_fn(online_params, target_params, x_batch, rng_key):
@@ -290,28 +290,23 @@ class TRIRL_PPO:
 
                     grad_byol_loss_fn = jax.value_and_grad(byol_loss_fn)
 
-                    # Prepare data (combine agent batch_states and sampled expert states)
+                    # BYOL data: the FULL rollout batch (agent states only, no expert states, no minibatching).
+                    # Per step: both views of all rollout states go through the online and target networks,
+                    # L_BYOL is computed, the online network takes one gradient step, then the target is EMA-updated.
+                    # nr_epochs_byol = number of such full-batch steps per TRIRL iteration (default 1).
                     batch_states = states.reshape((-1,) + self.os_shape)
-                    key, byol_expert_key = jax.random.split(key)
-                    byol_expert_idx = jax.random.randint(byol_expert_key, (self.batch_size,), 0, expert_states.shape[0])
-                    combined_states = jnp.concatenate([batch_states, expert_states[byol_expert_idx]], axis=0)
 
-                    # Create a randomized batch indices layout for BYOL across nr_epochs_byol
-                    key, subkey = jax.random.split(key)
-                    batch_indices_byol = jnp.tile(jnp.arange(combined_states.shape[0]), (self.nr_epochs_byol, 1))
-                    batch_indices_byol = jax.random.permutation(subkey, batch_indices_byol, axis=1, independent=True)
-                    batch_indices_byol = batch_indices_byol[:, :self.nr_minibatches * self.minibatch_size]
-                    batch_indices_byol = batch_indices_byol.reshape((self.nr_epochs_byol * self.nr_minibatches, self.minibatch_size))
-
-                    def byol_minibatch_update(carry, minibatch_indices):
+                    def byol_full_batch_update(carry, _):
                         byol_state, byol_target_params, loop_key = carry
                         loop_key, rng = jax.random.split(loop_key)
 
-                        minibatch_obs = combined_states[minibatch_indices]
+                        # 1) L_BYOL on all rollout states (online: enc->proj->pred, target: enc->proj with stop-grad)
+                        loss, grads = grad_byol_loss_fn(byol_state.params, byol_target_params, batch_states, rng)
 
-                        loss, grads = grad_byol_loss_fn(byol_state.params, byol_target_params, minibatch_obs, rng)
+                        # 2) update the online network
                         byol_state = byol_state.apply_gradients(grads=grads)
 
+                        # 3) EMA update of the target network: xi <- tau * xi + (1 - tau) * theta
                         byol_target_params = optax.incremental_update(
                             byol_state.params, byol_target_params, 1.0 - self.byol_tau
                         )
@@ -322,12 +317,13 @@ class TRIRL_PPO:
                         }
                         return (byol_state, byol_target_params, loop_key), metrics
 
-                    # Run the BYOL training loop
-                    init_carry = (byol_state, byol_target_params, key)
+                    key, byol_loop_key = jax.random.split(key)
                     carry, byol_optimization_metrics = jax.lax.scan(
-                        byol_minibatch_update, init_carry, batch_indices_byol
+                        byol_full_batch_update, (byol_state, byol_target_params, byol_loop_key), None, self.nr_epochs_byol
                     )
-                    byol_state, byol_target_params, key = carry
+                    byol_state, byol_target_params, _ = carry
+
+                    # 4) continue with TRIRL: features below come from the updated ONLINE encoder
                     byol_optimization_metrics["lr/learning_rate_byol"] = byol_state.opt_state[1].hyperparams["learning_rate"]
 
                     """ Discriminator Update """
@@ -651,15 +647,15 @@ class TRIRL_PPO:
                     combined_learning_iteration_step = (multi_learning_iteration_step * self.nr_updates_per_multi_learning_iteration) + learning_iteration_step + 1
                     jax.debug.callback(callback, (combined_metrics, learning_iteration_step, combined_learning_iteration_step, parallel_seed_id))
 
-                    return (policy_state, critic_state, discriminator_state, corrected_reward_state, (expert_states, expert_actions, expert_next_states, expert_absorbing, expert_features), env_state, byol_state, byol_target_params, key), discriminator_state.params['params']['theta']
+                    return (policy_state, critic_state, discriminator_state, corrected_reward_state, (expert_states, expert_actions, expert_next_states, expert_absorbing), env_state, byol_state, byol_target_params, key), discriminator_state.params['params']['theta']
 
                 key, subkey = jax.random.split(key)
                 learning_iteration_carry, inner_thetas = jax.lax.scan(learning_iteration, (policy_state, critic_state, discriminator_state, corrected_reward_state,
-                                                                                (expert_states, expert_actions, expert_next_states, expert_absorbing, expert_features),
+                                                                                (expert_states, expert_actions, expert_next_states, expert_absorbing),
                                                                                 env_state, byol_state, byol_target_params, subkey), jnp.arange(self.nr_updates_per_multi_learning_iteration))
 
                 policy_state, critic_state, discriminator_state, corrected_reward_state, \
-                (expert_states, expert_actions, expert_next_states, expert_absorbing, expert_features), \
+                (expert_states, expert_actions, expert_next_states, expert_absorbing), \
                 env_state, byol_state, byol_target_params, key = learning_iteration_carry
 
 
@@ -743,11 +739,11 @@ class TRIRL_PPO:
                     jax.debug.callback(save_with_check, policy_state, critic_state, discriminator_state,
                                        corrected_reward_state, byol_state, byol_target_params, eval_return_for_save)
 
-                return (policy_state, critic_state, discriminator_state, corrected_reward_state, (expert_states, expert_actions, expert_next_states, expert_absorbing, expert_features), env_state, byol_state, byol_target_params, key), inner_thetas
+                return (policy_state, critic_state, discriminator_state, corrected_reward_state, (expert_states, expert_actions, expert_next_states, expert_absorbing), env_state, byol_state, byol_target_params, key), inner_thetas
 
 
             _, all_thetas =  jax.lax.scan(multi_learning_and_eval_save_iteration, (policy_state, critic_state, discriminator_state, corrected_reward_state,
-                                                                  (expert_states, expert_actions, expert_next_states, expert_absorbing, expert_features),
+                                                                  (expert_states, expert_actions, expert_next_states, expert_absorbing),
                                                                   env_state, byol_state, byol_target_params, key), jnp.arange(self.nr_multi_learning_and_eval_save_iterations))
 
             # Make the jitted function return the data
