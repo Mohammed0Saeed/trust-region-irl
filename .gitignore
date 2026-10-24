@@ -19,3 +19,6 @@ experiments/evaluations/
 experiments/evaluation_scripts
 experiments/pusht_franka_eval_mtp
 experiments/evaluate_models.sh
+experiments/run_exp_byol.bash
+
+BYOL_CHANGES.md
