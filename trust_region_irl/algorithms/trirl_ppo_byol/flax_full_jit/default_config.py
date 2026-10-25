@@ -41,6 +41,7 @@ def get_config(algorithm_name):
 
     # BYOL Configuration
     config.byol_input_type = "state"  # "state" | "image"
+    config.byol_input = "obs"  # "obs": encoder sees the raw observation | "features": encoder sees env.feature_from_transition(s, a) (set environment.feature_fn)
     config.byol_hidden_dims = (64, 64)
     config.byol_latent_dim = 128
     config.byol_proj_hidden_dim = 256
@@ -51,7 +52,9 @@ def get_config(algorithm_name):
     config.nr_epochs_byol = 1  # number of full-rollout-batch BYOL steps per TRIRL iteration (online step + EMA each)
     config.byol_pretrain = False  # True: pretrain BYOL on expert + random-policy states before TRIRL, then keep training online
     config.byol_pretrain_steps = 1000  # number of BYOL gradient steps in the pretraining phase
-    config.byol_pretrain_log_frequency = 100  # log pretraining metrics every N steps
+    config.byol_pretrain_log_frequency = 100  # log pretraining metrics every N steps (every N rollout rounds if byol_pretrain_env_steps > 0)
+    config.byol_pretrain_env_steps = 0  # 0: pretrain on ONE rollout for byol_pretrain_steps steps. >0: stream ceil(env_steps / (nr_envs * nr_steps)) fresh rollouts
+    config.byol_pretrain_steps_per_rollout = 1024  # BYOL steps per streamed rollout (only used if byol_pretrain_env_steps > 0)
 
     config.handle_absorbing_states = True
     config.reward_type = 'feature-based'

@@ -98,6 +98,11 @@ class TRIRL_PPO:
 
         # BYOL Specific
         self.byol_input_type = config.algorithm.byol_input_type
+        self.byol_input = config.algorithm.byol_input
+        if self.byol_input not in ("obs", "features"):
+            raise ValueError(f"byol_input must be 'obs' or 'features', got '{self.byol_input}'")
+        if self.byol_input == "features" and not hasattr(self.train_env, "feature_from_transition"):
+            raise ValueError("byol_input='features' needs an env with feature_from_transition")
         self.byol_hidden_dims = config.algorithm.byol_hidden_dims
         self.byol_latent_dim = config.algorithm.byol_latent_dim
         self.byol_proj_hidden_dim = config.algorithm.byol_proj_hidden_dim
@@ -109,8 +114,12 @@ class TRIRL_PPO:
         self.byol_pretrain = config.algorithm.byol_pretrain
         self.byol_pretrain_steps = int(config.algorithm.byol_pretrain_steps)
         self.byol_pretrain_log_frequency = int(config.algorithm.byol_pretrain_log_frequency)
+        self.byol_pretrain_env_steps = int(float(config.algorithm.byol_pretrain_env_steps))
+        self.byol_pretrain_steps_per_rollout = int(config.algorithm.byol_pretrain_steps_per_rollout)
         if self.byol_pretrain and self.byol_pretrain_steps < 1:
             raise ValueError("byol_pretrain_steps must be >= 1 when byol_pretrain is True")
+        if self.byol_pretrain and self.byol_pretrain_env_steps > 0 and self.byol_pretrain_steps_per_rollout < 1:
+            raise ValueError("byol_pretrain_steps_per_rollout must be >= 1 when byol_pretrain_env_steps > 0")
 
         # Curriculum Thetas
         self.thetas = []
@@ -159,7 +168,7 @@ class TRIRL_PPO:
         action = jnp.array([self.train_env.single_action_space.sample(sampling_key)])
         self.H_terminal = jnp.sum(jnp.log(self.train_env.single_action_space.high - self.train_env.single_action_space.low))
 
-        byol_params = self.byol.init(byol_key, env_state.next_observation)
+        byol_params = self.byol.init(byol_key, self.byol_inputs(env_state.next_observation, action))
         self.byol_state = TrainState.create(
             apply_fn=self.byol.apply,
             params=byol_params,
@@ -170,7 +179,7 @@ class TRIRL_PPO:
         )
         # BYOL: the target network starts as an exact copy of the online network and then follows it by EMA
         self.byol_target_params = jax.tree_util.tree_map(jnp.copy, byol_params)
-        feature = self.byol.apply(self.byol_state.params, env_state.next_observation, method=self.byol.encode)
+        feature = self.byol.apply(self.byol_state.params, self.byol_inputs(env_state.next_observation, action), method=self.byol.encode)
 
         self.policy_state = TrainState.create(
             apply_fn=self.policy.apply,
@@ -208,6 +217,12 @@ class TRIRL_PPO:
             #self.best_eval_task_err = np.inf    # host-side tracker, updated in save callback
             self.latest_model_checkpointer = orbax.checkpoint.PyTreeCheckpointer()
 
+    def byol_inputs(self, observation, action):
+        """Input of the BYOL encoder: the raw observation, or the env's hand-crafted features if byol_input='features'."""
+        if self.byol_input == "features":
+            return self.train_env.feature_from_transition(observation, action)
+        return observation
+
     def train(self):
         def jitable_train_function(key, parallel_seed_id):
             key, reset_key = jax.random.split(key, 2)
@@ -223,6 +238,7 @@ class TRIRL_PPO:
             expert_next_states = demonstrations["next_states"]
             expert_actions = demonstrations["actions"]
             expert_absorbing = demonstrations["absorbing"].flatten()
+            expert_byol_inputs = self.byol_inputs(expert_states, expert_actions)  # BYOL pretraining data (expert half)
 
             # Set up carry objects
             policy_state = self.policy_state
@@ -264,6 +280,9 @@ class TRIRL_PPO:
             # rollout states + minibatch_size expert states (with replacement), computes L_BYOL, takes one
             # online gradient step and EMA-updates the target. Afterwards the encoder keeps training
             # online inside TRIRL exactly as without pretraining (the Adam state is carried over).
+            # With byol_pretrain_env_steps > 0 the data is streamed instead: ceil(env_steps / (nr_envs x nr_steps))
+            # rounds, each collecting a FRESH rollout (continuing the same separate env, random policy) followed by
+            # byol_pretrain_steps_per_rollout steps on it. Only one rollout is held in memory; metrics are averaged per round.
             if self.byol_pretrain:
                 key, pre_reset_key, pre_rollout_key, pre_loop_key = jax.random.split(key, 4)
                 pre_env_state = self.train_env.reset(jax.random.split(pre_reset_key, self.nr_envs), False)
@@ -275,34 +294,53 @@ class TRIRL_PPO:
                     action_mean, action_logstd = self.policy.apply(policy_state.params, observation)
                     action = action_mean + jnp.exp(action_logstd) * jax.random.normal(subkey, shape=action_mean.shape)
                     pre_env_state = self.train_env.step(pre_env_state, self.get_processed_action(action))
-                    return (pre_env_state, rollout_key), observation
+                    return (pre_env_state, rollout_key), self.byol_inputs(observation, action)
 
-                _, pretrain_rollout_states = jax.lax.scan(pretrain_rollout, (pre_env_state, pre_rollout_key), None, self.nr_steps)
-                pretrain_rollout_states = pretrain_rollout_states.reshape((-1,) + self.os_shape)
+                def run_byol_pretrain_steps(byol_state, byol_target_params, loop_key, pretrain_rollout_states, nr_pretrain_steps):
+                    def byol_pretrain_step(carry, _):
+                        byol_state, byol_target_params, loop_key = carry
+                        loop_key, rollout_idx_key, expert_idx_key, loss_key = jax.random.split(loop_key, 4)
+                        rollout_idx = jax.random.randint(rollout_idx_key, (self.minibatch_size,), 0, pretrain_rollout_states.shape[0])
+                        expert_idx = jax.random.randint(expert_idx_key, (self.minibatch_size,), 0, expert_byol_inputs.shape[0])
+                        x_batch = jnp.concatenate([pretrain_rollout_states[rollout_idx], expert_byol_inputs[expert_idx]], axis=0)
 
-                def byol_pretrain_step(carry, _):
-                    byol_state, byol_target_params, loop_key = carry
-                    loop_key, rollout_idx_key, expert_idx_key, loss_key = jax.random.split(loop_key, 4)
-                    rollout_idx = jax.random.randint(rollout_idx_key, (self.minibatch_size,), 0, pretrain_rollout_states.shape[0])
-                    expert_idx = jax.random.randint(expert_idx_key, (self.minibatch_size,), 0, expert_states.shape[0])
-                    x_batch = jnp.concatenate([pretrain_rollout_states[rollout_idx], expert_states[expert_idx]], axis=0)
+                        loss, grads = grad_byol_loss_fn(byol_state.params, byol_target_params, x_batch, loss_key)
+                        byol_state = byol_state.apply_gradients(grads=grads)
+                        byol_target_params = optax.incremental_update(byol_state.params, byol_target_params, 1.0 - self.byol_tau)
 
-                    loss, grads = grad_byol_loss_fn(byol_state.params, byol_target_params, x_batch, loss_key)
-                    byol_state = byol_state.apply_gradients(grads=grads)
-                    byol_target_params = optax.incremental_update(byol_state.params, byol_target_params, 1.0 - self.byol_tau)
+                        latent = self.byol.apply(byol_state.params, x_batch, method=self.byol.encode)
+                        metrics = {
+                            "pretrain/byol_loss": loss,
+                            "pretrain/byol_grad_norm": optax.global_norm(grads),
+                            "pretrain/latent_std": jnp.mean(jnp.std(latent, axis=0)),
+                            "pretrain/latent_norm": jnp.mean(jnp.linalg.norm(latent, axis=-1)),
+                        }
+                        return (byol_state, byol_target_params, loop_key), metrics
 
-                    latent = self.byol.apply(byol_state.params, x_batch, method=self.byol.encode)
-                    metrics = {
-                        "pretrain/byol_loss": loss,
-                        "pretrain/byol_grad_norm": optax.global_norm(grads),
-                        "pretrain/latent_std": jnp.mean(jnp.std(latent, axis=0)),
-                        "pretrain/latent_norm": jnp.mean(jnp.linalg.norm(latent, axis=-1)),
-                    }
-                    return (byol_state, byol_target_params, loop_key), metrics
+                    return jax.lax.scan(byol_pretrain_step, (byol_state, byol_target_params, loop_key), None, nr_pretrain_steps)
 
-                (byol_state, byol_target_params, _), pretrain_metrics = jax.lax.scan(
-                    byol_pretrain_step, (byol_state, byol_target_params, pre_loop_key), None, self.byol_pretrain_steps
-                )
+                if self.byol_pretrain_env_steps > 0:
+                    nr_pretrain_rounds = -(-self.byol_pretrain_env_steps // (self.nr_envs * self.nr_steps))  # ceil
+
+                    def byol_pretrain_round(carry, _):
+                        pre_env_state, rollout_key, byol_state, byol_target_params, loop_key = carry
+                        (pre_env_state, rollout_key), pretrain_rollout_states = jax.lax.scan(pretrain_rollout, (pre_env_state, rollout_key), None, self.nr_steps)
+                        pretrain_rollout_states = pretrain_rollout_states.reshape((-1, pretrain_rollout_states.shape[-1]))
+                        (byol_state, byol_target_params, loop_key), round_metrics = run_byol_pretrain_steps(
+                            byol_state, byol_target_params, loop_key, pretrain_rollout_states, self.byol_pretrain_steps_per_rollout
+                        )
+                        round_metrics = jax.tree_util.tree_map(jnp.mean, round_metrics)
+                        return (pre_env_state, rollout_key, byol_state, byol_target_params, loop_key), round_metrics
+
+                    (_, _, byol_state, byol_target_params, _), pretrain_metrics = jax.lax.scan(
+                        byol_pretrain_round, (pre_env_state, pre_rollout_key, byol_state, byol_target_params, pre_loop_key), None, nr_pretrain_rounds
+                    )
+                else:
+                    _, pretrain_rollout_states = jax.lax.scan(pretrain_rollout, (pre_env_state, pre_rollout_key), None, self.nr_steps)
+                    pretrain_rollout_states = pretrain_rollout_states.reshape((-1, pretrain_rollout_states.shape[-1]))
+                    (byol_state, byol_target_params, _), pretrain_metrics = run_byol_pretrain_steps(
+                        byol_state, byol_target_params, pre_loop_key, pretrain_rollout_states, self.byol_pretrain_steps
+                    )
                 jax.debug.callback(self.log_byol_pretraining, pretrain_metrics, parallel_seed_id)
 
             def multi_learning_and_eval_save_iteration(multi_learning_and_eval_save_iteration_carry, multi_learning_iteration_step):
@@ -352,13 +390,14 @@ class TRIRL_PPO:
                     # L_BYOL is computed, the online network takes one gradient step, then the target is EMA-updated.
                     # nr_epochs_byol = number of such full-batch steps per TRIRL iteration (default 1).
                     batch_states = states.reshape((-1,) + self.os_shape)
+                    batch_byol_inputs = self.byol_inputs(batch_states, actions.reshape((-1,) + self.as_shape))
 
                     def byol_full_batch_update(carry, _):
                         byol_state, byol_target_params, loop_key = carry
                         loop_key, rng = jax.random.split(loop_key)
 
                         # 1) L_BYOL on all rollout states (online: enc->proj->pred, target: enc->proj with stop-grad)
-                        loss, grads = grad_byol_loss_fn(byol_state.params, byol_target_params, batch_states, rng)
+                        loss, grads = grad_byol_loss_fn(byol_state.params, byol_target_params, batch_byol_inputs, rng)
 
                         # 2) update the online network
                         byol_state = byol_state.apply_gradients(grads=grads)
@@ -415,7 +454,7 @@ class TRIRL_PPO:
 
                     batch_states = states.reshape((-1,) + self.os_shape)
                     batch_actions = actions.reshape((-1,) + self.as_shape)
-                    batch_features = jax.lax.stop_gradient(self.byol.apply(byol_state.params, batch_states, method=self.byol.encode)) # get features
+                    batch_features = jax.lax.stop_gradient(self.byol.apply(byol_state.params, batch_byol_inputs, method=self.byol.encode)) # get features
                     byol_optimization_metrics["byol/latent_std"] = jnp.mean(jnp.std(batch_features, axis=0))
                     byol_optimization_metrics["byol/latent_norm"] = jnp.mean(jnp.linalg.norm(batch_features, axis=-1))
 
@@ -429,7 +468,7 @@ class TRIRL_PPO:
                     expert_idx = jax.random.randint(shuffle_key, (self.batch_size,), 0, expert_states.shape[0])
                     batch_expert_states = expert_states[expert_idx]
                     batch_expert_actions = expert_actions[expert_idx]
-                    batch_expert_features = jax.lax.stop_gradient(self.byol.apply(byol_state.params, batch_expert_states, method=self.byol.encode)) # get features
+                    batch_expert_features = jax.lax.stop_gradient(self.byol.apply(byol_state.params, self.byol_inputs(batch_expert_states, batch_expert_actions), method=self.byol.encode)) # get features
                     expert_labels = jnp.ones((self.batch_size, 1), dtype=jnp.float32)
                     rollout_labels = jnp.zeros((self.batch_size, 1), dtype=jnp.float32)
 
@@ -494,7 +533,7 @@ class TRIRL_PPO:
                         + self.epsilon * self.beta * _get_log_density_ratio(_inputs, discriminator_state).reshape(rewards.shape))
 
                     if self.handle_absorbing_states:
-                        features_absorbing = jax.lax.stop_gradient(self.byol.apply(byol_state.params, next_states.reshape((-1,) + self.os_shape), method=self.byol.encode))
+                        features_absorbing = jax.lax.stop_gradient(self.byol.apply(byol_state.params, self.byol_inputs(next_states.reshape((-1,) + self.os_shape), actions.reshape((-1,) + self.as_shape)), method=self.byol.encode))
                         _inputs_absorbing = (features_absorbing, next_states.reshape((-1,) + self.os_shape), actions.reshape((-1,) + self.as_shape), next_states.reshape((-1,) + self.os_shape), jnp.ones_like(terminations.flatten()))
                         corr_reward_absorbing_state = self.entropy_coef * ((1 - self.epsilon) * _get_log_density_ratio(_inputs_absorbing, corrected_reward_state).reshape(rewards.shape) \
                             + self.epsilon * self.beta * _get_log_density_ratio(_inputs_absorbing, discriminator_state).reshape(rewards.shape))
@@ -835,9 +874,11 @@ class TRIRL_PPO:
 
 
     def log_byol_pretraining(self, metrics, parallel_seed_id):
-        """Host-side logging of the BYOL pretraining phase (called once, after all pretraining steps)."""
+        """Host-side logging of the BYOL pretraining phase (called once, after all pretraining steps).
+        With byol_pretrain_env_steps > 0 each entry is one rollout round (metrics averaged over its steps)."""
         metrics = {k: np.asarray(v) for k, v in metrics.items()}
         nr_steps = next(iter(metrics.values())).shape[0]
+        unit = "round" if self.byol_pretrain_env_steps > 0 else "step"
         log_steps = sorted(set(list(range(0, nr_steps, max(1, self.byol_pretrain_log_frequency))) + [nr_steps - 1]))
         for step in log_steps:
             values = {k: float(v[step]) for k, v in metrics.items()}
@@ -847,7 +888,7 @@ class TRIRL_PPO:
             if self.track_wandb:
                 wandb.log({"pretrain/step": step + 1, **values})
             if self.track_console:
-                rlx_logger.info(f"[byol-pretrain] step {step + 1}/{nr_steps} | " + " | ".join(f"{k.split('/')[-1]}={v:.4f}" for k, v in values.items()))
+                rlx_logger.info(f"[byol-pretrain] {unit} {step + 1}/{nr_steps} | " + " | ".join(f"{k.split('/')[-1]}={v:.4f}" for k, v in values.items()))
         # Reset the SPS timer so the first TRIRL update does not count the pretraining time
         self.last_time[int(np.asarray(parallel_seed_id))] = time.time()
 
@@ -936,9 +977,10 @@ class TRIRL_PPO:
         byol = self.byol
         byol_params = self.byol_state.params
         entropy_coef = self.entropy_coef
+        byol_inputs = self.byol_inputs
 
         def reward_function(state, action, next_state, absorbing, log_prob=None):
-            feature = byol.apply(byol_params, state, method=byol.encode)
+            feature = byol.apply(byol_params, byol_inputs(state, action), method=byol.encode)
             params = corrected_reward_params
 
             reward = discriminator.apply(params, feature, state, action, next_state, absorbing)
@@ -953,9 +995,10 @@ class TRIRL_PPO:
         byol_params = self.byol_state.params
         entropy_coef = self.entropy_coef
         base_params = self.corrected_reward_state.params
+        byol_inputs = self.byol_inputs
 
         def reward_function(theta, state, action, next_state, absorbing, log_prob=None):
-            feature = byol.apply(byol_params, state, method=byol.encode)
+            feature = byol.apply(byol_params, byol_inputs(state, action), method=byol.encode)
             params = {
                 **base_params,
                 "params": {
