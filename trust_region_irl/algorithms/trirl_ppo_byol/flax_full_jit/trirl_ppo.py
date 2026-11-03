@@ -110,6 +110,7 @@ class TRIRL_PPO:
         self.learning_rate_byol = config.algorithm.learning_rate_byol
         self.byol_tau = config.algorithm.byol_tau
         self.byol_noise_scale = config.algorithm.byol_noise_scale
+        self.augmentation = config.algorithm.augmentation
         self.nr_epochs_byol = config.algorithm.nr_epochs_byol
         self.byol_pretrain = config.algorithm.byol_pretrain
         self.byol_pretrain_steps = int(config.algorithm.byol_pretrain_steps)
@@ -121,9 +122,9 @@ class TRIRL_PPO:
         if self.byol_pretrain and self.byol_pretrain_env_steps > 0 and self.byol_pretrain_steps_per_rollout < 1:
             raise ValueError("byol_pretrain_steps_per_rollout must be >= 1 when byol_pretrain_env_steps > 0")
 
-        # Curriculum Thetas
-        self.thetas = []
-        self.theta_save_frequency = 1 # 1 for saving every theta collected
+        # Curriculum Thetas: corrected-reward theta of every TRIRL iteration, keyed by outer (eval/save) iteration.
+        # Written to models/theta_matrix.npy at every save (save_thetas) and once more at the end of training.
+        self.thetas_by_save_iteration = {}
         self.curriculum_learning_mode = config.algorithm.curriculum_learning
 
         if self.minibatch_size > self.batch_size:
@@ -251,6 +252,8 @@ class TRIRL_PPO:
             """ BYOL loss (shared by the pretraining phase and the online update inside TRIRL) """
 
             def augment_state(x, rng_key):
+                if not self.augmentation:
+                    return x
                 return x + self.byol_noise_scale * jax.random.normal(rng_key, shape=x.shape)
 
             def byol_loss_fn(online_params, target_params, x_batch, rng_key):
@@ -296,8 +299,13 @@ class TRIRL_PPO:
                     pre_env_state = self.train_env.step(pre_env_state, self.get_processed_action(action))
                     return (pre_env_state, rollout_key), self.byol_inputs(observation, action)
 
-                def run_byol_pretrain_steps(byol_state, byol_target_params, loop_key, pretrain_rollout_states, nr_pretrain_steps):
-                    def byol_pretrain_step(carry, _):
+                # Live logging: one host callback per pretraining step (single-rollout mode) or per round (streamed mode).
+                # log_byol_pretraining decides on the host which entries to log (every byol_pretrain_log_frequency + the last).
+                def log_pretrain_entry(metrics, entry_idx, nr_entries):
+                    jax.debug.callback(lambda m, i, p: self.log_byol_pretraining(m, i, nr_entries, p), metrics, entry_idx, parallel_seed_id)
+
+                def run_byol_pretrain_steps(byol_state, byol_target_params, loop_key, pretrain_rollout_states, nr_pretrain_steps, log_each_step):
+                    def byol_pretrain_step(carry, step_idx):
                         byol_state, byol_target_params, loop_key = carry
                         loop_key, rollout_idx_key, expert_idx_key, loss_key = jax.random.split(loop_key, 4)
                         rollout_idx = jax.random.randint(rollout_idx_key, (self.minibatch_size,), 0, pretrain_rollout_states.shape[0])
@@ -315,33 +323,35 @@ class TRIRL_PPO:
                             "pretrain/latent_std": jnp.mean(jnp.std(latent, axis=0)),
                             "pretrain/latent_norm": jnp.mean(jnp.linalg.norm(latent, axis=-1)),
                         }
+                        if log_each_step:
+                            log_pretrain_entry(metrics, step_idx, nr_pretrain_steps)
                         return (byol_state, byol_target_params, loop_key), metrics
 
-                    return jax.lax.scan(byol_pretrain_step, (byol_state, byol_target_params, loop_key), None, nr_pretrain_steps)
+                    return jax.lax.scan(byol_pretrain_step, (byol_state, byol_target_params, loop_key), jnp.arange(nr_pretrain_steps))
 
                 if self.byol_pretrain_env_steps > 0:
                     nr_pretrain_rounds = -(-self.byol_pretrain_env_steps // (self.nr_envs * self.nr_steps))  # ceil
 
-                    def byol_pretrain_round(carry, _):
+                    def byol_pretrain_round(carry, round_idx):
                         pre_env_state, rollout_key, byol_state, byol_target_params, loop_key = carry
                         (pre_env_state, rollout_key), pretrain_rollout_states = jax.lax.scan(pretrain_rollout, (pre_env_state, rollout_key), None, self.nr_steps)
                         pretrain_rollout_states = pretrain_rollout_states.reshape((-1, pretrain_rollout_states.shape[-1]))
                         (byol_state, byol_target_params, loop_key), round_metrics = run_byol_pretrain_steps(
-                            byol_state, byol_target_params, loop_key, pretrain_rollout_states, self.byol_pretrain_steps_per_rollout
+                            byol_state, byol_target_params, loop_key, pretrain_rollout_states, self.byol_pretrain_steps_per_rollout, log_each_step=False
                         )
                         round_metrics = jax.tree_util.tree_map(jnp.mean, round_metrics)
-                        return (pre_env_state, rollout_key, byol_state, byol_target_params, loop_key), round_metrics
+                        log_pretrain_entry(round_metrics, round_idx, nr_pretrain_rounds)
+                        return (pre_env_state, rollout_key, byol_state, byol_target_params, loop_key), None
 
-                    (_, _, byol_state, byol_target_params, _), pretrain_metrics = jax.lax.scan(
-                        byol_pretrain_round, (pre_env_state, pre_rollout_key, byol_state, byol_target_params, pre_loop_key), None, nr_pretrain_rounds
+                    (_, _, byol_state, byol_target_params, _), _ = jax.lax.scan(
+                        byol_pretrain_round, (pre_env_state, pre_rollout_key, byol_state, byol_target_params, pre_loop_key), jnp.arange(nr_pretrain_rounds)
                     )
                 else:
                     _, pretrain_rollout_states = jax.lax.scan(pretrain_rollout, (pre_env_state, pre_rollout_key), None, self.nr_steps)
                     pretrain_rollout_states = pretrain_rollout_states.reshape((-1, pretrain_rollout_states.shape[-1]))
-                    (byol_state, byol_target_params, _), pretrain_metrics = run_byol_pretrain_steps(
-                        byol_state, byol_target_params, pre_loop_key, pretrain_rollout_states, self.byol_pretrain_steps
+                    (byol_state, byol_target_params, _), _ = run_byol_pretrain_steps(
+                        byol_state, byol_target_params, pre_loop_key, pretrain_rollout_states, self.byol_pretrain_steps, log_each_step=True
                     )
-                jax.debug.callback(self.log_byol_pretraining, pretrain_metrics, parallel_seed_id)
 
             def multi_learning_and_eval_save_iteration(multi_learning_and_eval_save_iteration_carry, multi_learning_iteration_step):
                 policy_state, critic_state, discriminator_state, corrected_reward_state, \
@@ -743,7 +753,7 @@ class TRIRL_PPO:
                     combined_learning_iteration_step = (multi_learning_iteration_step * self.nr_updates_per_multi_learning_iteration) + learning_iteration_step + 1
                     jax.debug.callback(callback, (combined_metrics, learning_iteration_step, combined_learning_iteration_step, parallel_seed_id))
 
-                    return (policy_state, critic_state, discriminator_state, corrected_reward_state, (expert_states, expert_actions, expert_next_states, expert_absorbing), env_state, byol_state, byol_target_params, key), discriminator_state.params['params']['theta']
+                    return (policy_state, critic_state, discriminator_state, corrected_reward_state, (expert_states, expert_actions, expert_next_states, expert_absorbing), env_state, byol_state, byol_target_params, key), corrected_reward_state.params['params']['theta']  # the reward theta the policy uses (retraining / curriculum)
 
                 key, subkey = jax.random.split(key)
                 learning_iteration_carry, inner_thetas = jax.lax.scan(learning_iteration, (policy_state, critic_state, discriminator_state, corrected_reward_state,
@@ -834,6 +844,7 @@ class TRIRL_PPO:
 
                     jax.debug.callback(save_with_check, policy_state, critic_state, discriminator_state,
                                        corrected_reward_state, byol_state, byol_target_params, eval_return_for_save)
+                    jax.debug.callback(self.save_thetas, inner_thetas, multi_learning_iteration_step)
 
                 return (policy_state, critic_state, discriminator_state, corrected_reward_state, (expert_states, expert_actions, expert_next_states, expert_absorbing), env_state, byol_state, byol_target_params, key), inner_thetas
 
@@ -873,24 +884,28 @@ class TRIRL_PPO:
             self.log_console(name, value)
 
 
-    def log_byol_pretraining(self, metrics, parallel_seed_id):
-        """Host-side logging of the BYOL pretraining phase (called once, after all pretraining steps).
-        With byol_pretrain_env_steps > 0 each entry is one rollout round (metrics averaged over its steps)."""
-        metrics = {k: np.asarray(v) for k, v in metrics.items()}
-        nr_steps = next(iter(metrics.values())).shape[0]
+    def log_byol_pretraining(self, metrics, entry_idx, nr_entries, parallel_seed_id):
+        """Host-side logging of one BYOL pretraining entry, called live from inside the pretraining scan.
+        An entry is one BYOL step, or one rollout round (metrics averaged over its steps) if byol_pretrain_env_steps > 0.
+        Only every byol_pretrain_log_frequency-th entry and the last one are logged (TensorBoard, W&B, console)."""
+        step = int(np.asarray(entry_idx))
+        is_last = step == nr_entries - 1
+        if step % max(1, self.byol_pretrain_log_frequency) != 0 and not is_last:
+            return
+        values = {k: float(np.asarray(v)) for k, v in metrics.items()}
         unit = "round" if self.byol_pretrain_env_steps > 0 else "step"
-        log_steps = sorted(set(list(range(0, nr_steps, max(1, self.byol_pretrain_log_frequency))) + [nr_steps - 1]))
-        for step in log_steps:
-            values = {k: float(v[step]) for k, v in metrics.items()}
-            if self.track_tb:
-                for name, value in values.items():
-                    self.writer.add_scalar(name, value, step + 1)
-            if self.track_wandb:
-                wandb.log({"pretrain/step": step + 1, **values})
-            if self.track_console:
-                rlx_logger.info(f"[byol-pretrain] {unit} {step + 1}/{nr_steps} | " + " | ".join(f"{k.split('/')[-1]}={v:.4f}" for k, v in values.items()))
-        # Reset the SPS timer so the first TRIRL update does not count the pretraining time
-        self.last_time[int(np.asarray(parallel_seed_id))] = time.time()
+        if self.track_tb:
+            for name, value in values.items():
+                self.writer.add_scalar(name, value, step + 1)
+        if self.track_wandb:
+            # rl_x plots every metric against global_step (define_metric("*", step_metric="global_step")), so entries
+            # without it get no chart. During pretraining global_step is the pretraining step/round; pretrain/* only exist here.
+            wandb.log({"global_step": step + 1, "pretrain/step": step + 1, **values})
+        if self.track_console:
+            rlx_logger.info(f"[byol-pretrain] {unit} {step + 1}/{nr_entries} | " + " | ".join(f"{k.split('/')[-1]}={v:.4f}" for k, v in values.items()))
+        if is_last:
+            # Reset the SPS timer so the first TRIRL update does not count the pretraining time
+            self.last_time[int(np.asarray(parallel_seed_id))] = time.time()
 
     def log_console(self, name, value):
         value = np.format_float_positional(value, trim="-")
@@ -912,6 +927,14 @@ class TRIRL_PPO:
         if self.track_console:
             rlx_logger.info("└" + "─" * 31 + "┴" + "─" * 16 + "┘")
 
+
+    def save_thetas(self, inner_thetas, save_iteration):
+        """Write models/theta_matrix.npy with the corrected-reward thetas recorded so far (one row per TRIRL iteration),
+        so the file exists even if the run is killed before the end. Keyed by save iteration, so rows stay in order."""
+        self.thetas_by_save_iteration[int(np.asarray(save_iteration))] = np.asarray(inner_thetas)
+        thetas = np.concatenate([self.thetas_by_save_iteration[k] for k in sorted(self.thetas_by_save_iteration)], axis=0)
+        os.makedirs(self.save_path, exist_ok=True)
+        np.save(os.path.join(self.save_path, "theta_matrix.npy"), thetas)
 
     def save(self, policy_state, critic_state, discriminator_state, corrected_reward_state, byol_state, byol_target_params, file_name=None):
         file_name = file_name or self.latest_model_file_name

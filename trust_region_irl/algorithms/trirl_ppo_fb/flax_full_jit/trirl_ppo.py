@@ -17,11 +17,11 @@ import wandb
 import re
 
 from trust_region_irl.algorithms.ppo_retraining_curriculum import PPO_RETRAINING_CURRICULUM
-from trust_region_irl.algorithms.trirl_ppo_byol.flax_full_jit.general_properties import GeneralProperties
-from trust_region_irl.algorithms.trirl_ppo_byol.flax_full_jit.policy import get_policy
-from trust_region_irl.algorithms.trirl_ppo_byol.flax_full_jit.critic import get_critic
-from trust_region_irl.algorithms.trirl_ppo_byol.flax_full_jit.discriminator import get_discriminator
-from trust_region_irl.algorithms.trirl_ppo_byol.flax_full_jit.data_utils import prepare_expert_data, expert_data_spec
+from trust_region_irl.algorithms.trirl_ppo_byol_s.flax_full_jit.general_properties import GeneralProperties
+from trust_region_irl.algorithms.trirl_ppo_byol_s.flax_full_jit.policy import get_policy
+from trust_region_irl.algorithms.trirl_ppo_byol_s.flax_full_jit.critic import get_critic
+from trust_region_irl.algorithms.trirl_ppo_byol_s.flax_full_jit.discriminator import get_discriminator
+from trust_region_irl.algorithms.trirl_ppo_byol_s.flax_full_jit.data_utils import prepare_expert_data, expert_data_spec
 
 rlx_logger = logging.getLogger("rl_x")
 
@@ -101,10 +101,9 @@ class TRIRL_PPO:
         self.reward_type = config.algorithm.reward_type
         self.num_data_samples = prepare_expert_data(self.data_path)["states"].shape[0]
 
-        # Curriculum Thetas
-        # freq = self.nr_steps // N
-        self.thetas = []
-        self.theta_save_frequency = 1 # 1 for saving every theta collected
+        # Curriculum Thetas: corrected-reward theta of every TRIRL iteration, keyed by outer (eval/save) iteration.
+        # Written to models/theta_matrix.npy at every save (save_thetas) and once more at the end of training.
+        self.thetas_by_save_iteration = {}
         self.curriculum_learning_mode = config.algorithm.curriculum_learning
 
         if self.minibatch_size > self.batch_size:
@@ -617,7 +616,7 @@ class TRIRL_PPO:
                     combined_learning_iteration_step = (multi_learning_iteration_step * self.nr_updates_per_multi_learning_iteration) + learning_iteration_step + 1
                     jax.debug.callback(callback, (combined_metrics, learning_iteration_step, combined_learning_iteration_step, parallel_seed_id))
 
-                    return (policy_state, critic_state, discriminator_state, corrected_reward_state, (expert_states, expert_actions, expert_next_states, expert_absorbing, expert_features), env_state, key), discriminator_state.params['params']['theta']
+                    return (policy_state, critic_state, discriminator_state, corrected_reward_state, (expert_states, expert_actions, expert_next_states, expert_absorbing, expert_features), env_state, key), corrected_reward_state.params['params']['theta']  # the reward theta the policy uses (retraining / curriculum)
 
                 key, subkey = jax.random.split(key)
                 learning_iteration_carry, inner_thetas = jax.lax.scan(learning_iteration, (policy_state, critic_state, discriminator_state, corrected_reward_state,
@@ -708,6 +707,7 @@ class TRIRL_PPO:
 
                     jax.debug.callback(save_with_check, policy_state, critic_state, discriminator_state,
                                        corrected_reward_state, eval_return_for_save)
+                    jax.debug.callback(self.save_thetas, inner_thetas, multi_learning_iteration_step)
 
                 return (policy_state, critic_state, discriminator_state, corrected_reward_state, (expert_states, expert_actions, expert_next_states, expert_absorbing, expert_features), env_state, key), inner_thetas
 
@@ -767,6 +767,14 @@ class TRIRL_PPO:
         if self.track_console:
             rlx_logger.info("└" + "─" * 31 + "┴" + "─" * 16 + "┘")
 
+
+    def save_thetas(self, inner_thetas, save_iteration):
+        """Write models/theta_matrix.npy with the corrected-reward thetas recorded so far (one row per TRIRL iteration),
+        so the file exists even if the run is killed before the end. Keyed by save iteration, so rows stay in order."""
+        self.thetas_by_save_iteration[int(np.asarray(save_iteration))] = np.asarray(inner_thetas)
+        thetas = np.concatenate([self.thetas_by_save_iteration[k] for k in sorted(self.thetas_by_save_iteration)], axis=0)
+        os.makedirs(self.save_path, exist_ok=True)
+        np.save(os.path.join(self.save_path, "theta_matrix.npy"), thetas)
 
     def save(self, policy_state, critic_state, discriminator_state, corrected_reward_state, file_name=None):
         file_name = file_name or self.latest_model_file_name
