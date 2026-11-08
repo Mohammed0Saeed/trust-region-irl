@@ -3,7 +3,7 @@ from flax.linen.initializers import constant, orthogonal
 from rl_x.environments.action_space_type import ActionSpaceType
 from rl_x.environments.observation_space_type import ObservationSpaceType
 from collections import deque
-from trust_region_irl.algorithms.trirl_ppo_byol_s.flax_full_jit.byol import BYOL
+from trust_region_irl.algorithms.trirl_ppo_spr.flax_full_jit.byol import BYOL
 
 def get_discriminator(config, env, reward_type='feature-based'):
     action_space_type = env.general_properties.action_space_type
