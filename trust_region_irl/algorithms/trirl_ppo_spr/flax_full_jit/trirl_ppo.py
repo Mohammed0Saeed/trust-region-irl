@@ -22,7 +22,7 @@ from trust_region_irl.algorithms.trirl_ppo_spr.flax_full_jit.general_properties 
 from trust_region_irl.algorithms.trirl_ppo_spr.flax_full_jit.policy import get_policy
 from trust_region_irl.algorithms.trirl_ppo_spr.flax_full_jit.critic import get_critic
 from trust_region_irl.algorithms.trirl_ppo_spr.flax_full_jit.discriminator import get_discriminator
-from trust_region_irl.algorithms.trirl_ppo_spr.flax_full_jit.data_utils import prepare_expert_data, expert_data_spec
+from trust_region_irl.algorithms.trirl_ppo_spr.flax_full_jit.data_utils import prepare_expert_data, expert_data_spec, agent_windows, expert_windows
 
 rlx_logger = logging.getLogger("rl_x")
 
@@ -102,6 +102,24 @@ class TRIRL_PPO:
         self.warmup_env_steps = config.algorithm.warmup_env_steps
         self.w_disc_loss = config.algorithm.w_disc_loss
         self.target_momentum = config.algorithm.target_momentum
+        self.prediction_steps = config.algorithm.prediction_steps
+
+        self.curriculum_success = config.environment.get("curriculum_success", False)
+        if self.curriculum_success:
+            # load thresholds from config
+            threshold_values = [float(v) for v in config.environment.success_threshold_values.split(",")]
+            threshold_fractions = [float(f) for f in config.environment.success_threshold_fractions.split(",")]
+
+            # Check if number of thresholds is the same as number of fractions
+            if len(threshold_values) != len(threshold_fractions):
+                raise ValueError("success_threshold_values and success_threshold_fractions must have the same number of entries")
+            if abs(sum(threshold_fractions) - 1.0) > 1e-6:
+                raise ValueError(f"success_threshold_fractions must sum to 1, got {sum(threshold_fractions)}")
+
+            self.success_threshold_values = jnp.array(threshold_values, dtype=jnp.float32)
+            # Env step at which each threshold after the first one starts
+            self.success_threshold_boundaries = jnp.array(np.cumsum(threshold_fractions)[:-1] * self.total_timesteps, dtype=jnp.float32)
+            self.final_success_threshold = threshold_values[-1]  # evaluation always uses the final threshold
 
         # Curriculum Thetas: corrected-reward theta of every TRIRL iteration, keyed by outer (eval/save) iteration.
         # Written to models/theta_matrix.npy at every save (save_thetas) and once more at the end of training.
@@ -220,27 +238,34 @@ class TRIRL_PPO:
             corrected_reward_state = self.corrected_reward_state
 
             """ BYOL Pre-training """
-            # Encoder-only pre-training before TRIRL: rollouts with the initial policy (never updated) plus expert
-            # batches, trained with the cosine loss alone. Theta, policy, critic and reward correction are untouched.
-            def pretrain_loss_fn(discriminator_params, state, action, next_state, expert_state, expert_action, expert_next_state):
-                _, p, y = self.discriminator.apply(discriminator_params, state, action, next_state)
-                _, expert_p, expert_y = self.discriminator.apply(discriminator_params, expert_state, expert_action, expert_next_state)
+            def pretrain_loss_fn(discriminator_params, state, action_window, next_state_window, weight,
+                                 expert_state, expert_action_window, expert_next_state_window, expert_weight):
+                # k-step chain: p, y have shape (k, 128), one row per predicted future state
+                _, p, y = self.discriminator.apply(discriminator_params, state, action_window, next_state_window, method=self.discriminator.multi_step_byol)
+                _, expert_p, expert_y = self.discriminator.apply(discriminator_params, expert_state, expert_action_window, expert_next_state_window, method=self.discriminator.multi_step_byol)
 
                 y = jax.lax.stop_gradient(y)
                 expert_y = jax.lax.stop_gradient(expert_y)
 
-                p = p / (jnp.linalg.norm(p) + 1e-12)
-                expert_p = expert_p / (jnp.linalg.norm(expert_p) + 1e-12)
-                y = y / (jnp.linalg.norm(y) + 1e-12)
-                expert_y = expert_y / (jnp.linalg.norm(expert_y) + 1e-12)
+                # normalise every step's vector on its own (axis=-1), not the whole (k, 128) array
+                p = p / (jnp.linalg.norm(p, axis=-1, keepdims=True) + 1e-12)
+                expert_p = expert_p / (jnp.linalg.norm(expert_p, axis=-1, keepdims=True) + 1e-12)
+                y = y / (jnp.linalg.norm(y, axis=-1, keepdims=True) + 1e-12)
+                expert_y = expert_y / (jnp.linalg.norm(expert_y, axis=-1, keepdims=True) + 1e-12)
 
-                byol_loss = 0.5 * ((2 - 2 * jnp.dot(p, y)) + (2 - 2 * jnp.dot(expert_p, expert_y)))
+                # cosine loss per step (k,); weight = 0 for windows that leave the rollout or cross an episode end
+                step_loss = weight * (2 - 2 * jnp.sum(p * y, axis=-1))
+                expert_step_loss = expert_weight * (2 - 2 * jnp.sum(expert_p * expert_y, axis=-1))
+
+                byol_loss = 0.5 * (jnp.sum(step_loss) + jnp.sum(expert_step_loss))
                 metrics = {
                     "pretrain/byol_loss": byol_loss,
                 }
+                for i in range(self.prediction_steps):
+                    metrics[f"pretrain/byol_step_{i + 1}"] = 0.5 * (step_loss[i] + expert_step_loss[i])
                 return byol_loss, (metrics)
 
-            vmap_pretrain_loss_fn = jax.vmap(pretrain_loss_fn, in_axes=(None, 0, 0, 0, 0, 0, 0), out_axes=0)
+            vmap_pretrain_loss_fn = jax.vmap(pretrain_loss_fn, in_axes=(None, 0, 0, 0, 0, 0, 0, 0, 0), out_axes=0)
             mean_vmapped_pretrain_loss_fn = lambda *a, **k: tree.map_structure(jnp.mean, vmap_pretrain_loss_fn(*a, **k))
             grad_pretrain_loss_fn = jax.value_and_grad(mean_vmapped_pretrain_loss_fn, argnums=(0), has_aux=True)
 
@@ -263,22 +288,24 @@ class TRIRL_PPO:
                 action = action_mean + jnp.exp(action_logstd) * jax.random.normal(subkey, shape=action_mean.shape)
                 env_state = self.train_env.step(env_state, self.get_processed_action(action))
 
-                return (env_state, key), (observation, env_state.actual_next_observation, action)
+                return (env_state, key), (observation, env_state.actual_next_observation, action, env_state.terminated | env_state.truncated)
 
             def pretrain_iteration(pretrain_iteration_carry, pretrain_iteration_step):
                 pretrain_state, env_state, key = pretrain_iteration_carry
 
-                (env_state, key), (states, next_states, actions) = jax.lax.scan(pretrain_rollout, (env_state, key), None, self.nr_steps)
+                (env_state, key), (states, next_states, actions, dones) = jax.lax.scan(pretrain_rollout, (env_state, key), None, self.nr_steps)
                 batch_states = states.reshape((-1,) + self.os_shape)
                 batch_next_states = next_states.reshape((-1,) + self.os_shape)
-                batch_actions = actions.reshape((-1,) + self.as_shape)
+                # batch_actions = actions.reshape((-1,) + self.as_shape)
+                batch_action_windows, batch_next_states_windows, batch_valid, batch_weights = agent_windows(actions, next_states, dones, self.prediction_steps)
 
                 # Expert batch sampled with replacement, as in the discriminator update
                 key, expert_key, permutation_key = jax.random.split(key, 3)
                 expert_idx = jax.random.randint(expert_key, (self.batch_size,), 0, expert_states.shape[0])
                 batch_expert_states = expert_states[expert_idx]
-                batch_expert_actions = expert_actions[expert_idx]
-                batch_expert_next_states = expert_next_states[expert_idx]
+                batch_expert_actions_windows, batch_expert_next_states_windows, batch_expert_valid, batch_expert_weights = expert_windows(expert_actions, expert_next_states, expert_absorbing, expert_idx, self.prediction_steps)
+                # batch_expert_actions = expert_actions[expert_idx]
+                # batch_expert_next_states = expert_next_states[expert_idx]
 
                 batch_indices = jnp.tile(jnp.arange(self.batch_size), (self.nr_epochs_disc, 1))
                 batch_indices = jax.random.permutation(permutation_key, batch_indices, axis=1, independent=True)
@@ -289,11 +316,13 @@ class TRIRL_PPO:
                     (pretrain_loss, (metrics)), (pretrain_gradients) = grad_pretrain_loss_fn(
                         pretrain_state.params,
                         batch_states[minibatch_indices],
-                        batch_actions[minibatch_indices],
-                        batch_next_states[minibatch_indices],
+                        batch_action_windows[minibatch_indices],
+                        batch_next_states_windows[minibatch_indices],
+                        batch_weights[minibatch_indices],
                         batch_expert_states[minibatch_indices],
-                        batch_expert_actions[minibatch_indices],
-                        batch_expert_next_states[minibatch_indices],
+                        batch_expert_actions_windows[minibatch_indices],
+                        batch_expert_next_states_windows[minibatch_indices],
+                        batch_expert_weights[minibatch_indices],
                     )
                     pretrain_state = pretrain_state.apply_gradients(grads=pretrain_gradients)
                     pretrain_state = update_target(pretrain_state)
@@ -336,6 +365,12 @@ class TRIRL_PPO:
                     (expert_states, expert_actions, expert_next_states, expert_absorbing, expert_features), \
                     env_state, key = learning_iteration_carry
 
+                    # Success-threshold curriculum: pick the threshold from the env steps done before this rollout
+                    if self.curriculum_success:
+                        steps_done = ((multi_learning_iteration_step * self.nr_updates_per_multi_learning_iteration) + learning_iteration_step) * self.batch_size
+                        stage = jnp.searchsorted(self.success_threshold_boundaries, steps_done, side="right")
+                        env_state = env_state.replace(success_threshold=jnp.full_like(env_state.success_threshold, self.success_threshold_values[stage]))
+
                         # Acting
                     def single_rollout(single_rollout_carry, _):
                         policy_state, critic_state, env_state, key = single_rollout_carry
@@ -351,7 +386,7 @@ class TRIRL_PPO:
                         action_logstd = jnp.repeat(action_logstd[None, :], action_mean.shape[0], axis=0)
 
                         env_state = self.train_env.step(env_state, processed_action)
-                        transition = (observation, env_state.actual_next_observation, action, env_state.reward, value, env_state.terminated, log_prob, action_mean, action_logstd, env_state.info)
+                        transition = (observation, env_state.actual_next_observation, action, env_state.reward, value, env_state.terminated, log_prob, action_mean, action_logstd, env_state.info, env_state.terminated | env_state.truncated)
                         if self.render:
                             def render(env_state):
                                 return self.train_env.render(env_state)
@@ -362,13 +397,14 @@ class TRIRL_PPO:
 
                     single_rollout_carry, batch = jax.lax.scan(single_rollout, (policy_state, critic_state, env_state, key), None, self.nr_steps)
                     policy_state, critic_state, env_state, key = single_rollout_carry
-                    states, next_states, actions, rewards, values, terminations, log_probs, old_action_means, old_action_logstd, infos = batch
+                    states, next_states, actions, rewards, values, terminations, log_probs, old_action_means, old_action_logstd, infos, dones = batch
 
                     """ Discriminator Update """
 
                     # encoder_switch: 0.0 during warm-up (discriminator loss does not train the encoder), 1.0 afterwards
                     def trirl_loss_fn(discriminator_params, state, action, expert_state, expert_action, label, expert_label,
-                                        next_state, absorbing, expert_next_state, expert_absorbing, encoder_switch):
+                                        action_window, next_state_window, weight, absorbing,
+                                        expert_action_window, expert_next_state_window, expert_weight, expert_absorbing, encoder_switch):
                         def update_param(w):
                             return encoder_switch * w + (1.0 - encoder_switch) * jax.lax.stop_gradient(w)
 
@@ -398,25 +434,24 @@ class TRIRL_PPO:
 
                         bce_loss = bce_agent + bce_expert + gp_lambda * gp
 
-                        # BYOL Loss
-                        z, p, y = self.discriminator.apply(discriminator_params, state, action, next_state)
-                        expert_z, expert_p, expert_y = self.discriminator.apply(discriminator_params, expert_state, expert_action, expert_next_state)
+                        # BYOL Loss: k-step chain, p and y have shape (k, 128); real params so the encoder trains during warm-up
+                        z, p, y = self.discriminator.apply(discriminator_params, state, action_window, next_state_window, method=self.discriminator.multi_step_byol)
+                        expert_z, expert_p, expert_y = self.discriminator.apply(discriminator_params, expert_state, expert_action_window, expert_next_state_window, method=self.discriminator.multi_step_byol)
 
                         y = jax.lax.stop_gradient(y)
                         expert_y = jax.lax.stop_gradient(expert_y)
 
-                        p = p / (jnp.linalg.norm(p) + 1e-12)
-                        expert_p = expert_p / (jnp.linalg.norm(expert_p) + 1e-12)
-                        y = y / (jnp.linalg.norm(y) + 1e-12)
-                        expert_y = expert_y / (jnp.linalg.norm(expert_y) + 1e-12)
+                        # normalise every step's vector on its own (axis=-1), not the whole (k, 128) array
+                        p = p / (jnp.linalg.norm(p, axis=-1, keepdims=True) + 1e-12)
+                        expert_p = expert_p / (jnp.linalg.norm(expert_p, axis=-1, keepdims=True) + 1e-12)
+                        y = y / (jnp.linalg.norm(y, axis=-1, keepdims=True) + 1e-12)
+                        expert_y = expert_y / (jnp.linalg.norm(expert_y, axis=-1, keepdims=True) + 1e-12)
 
-                        def cosine_loss(norm_p, norm_y):
-                            return 2 - 2 * (jnp.dot(norm_p, norm_y))
+                        # cosine loss per step (k,); weight = 0 for windows that leave the rollout or cross an episode end
+                        step_loss = weight * (2 - 2 * jnp.sum(p * y, axis=-1))
+                        expert_step_loss = expert_weight * (2 - 2 * jnp.sum(expert_p * expert_y, axis=-1))
 
-                        loss_agent = cosine_loss(p, y)
-                        loss_expert = cosine_loss(expert_p, expert_y)
-
-                        BYOL_loss = 0.5 * (loss_agent + loss_expert)
+                        BYOL_loss = 0.5 * (jnp.sum(step_loss) + jnp.sum(expert_step_loss))
 
                         total_loss = BYOL_loss + self.w_disc_loss * bce_loss
 
@@ -429,6 +464,8 @@ class TRIRL_PPO:
                             "loss/discriminator_expert_loss": bce_expert,
                             "loss/discriminator_gp": gp,
                         }
+                        for i in range(self.prediction_steps):
+                            metrics[f"loss/byol_step_{i + 1}"] = 0.5 * (step_loss[i] + expert_step_loss[i])
                         return total_loss, (metrics)
 
                     batch_states = states.reshape((-1,) + self.os_shape)
@@ -447,16 +484,18 @@ class TRIRL_PPO:
                     expert_labels = jnp.ones((self.batch_size, 1), dtype=jnp.float32)
                     rollout_labels = jnp.zeros((self.batch_size, 1), dtype=jnp.float32)
 
-                    batch_next_states = next_states.reshape((-1,) + self.os_shape)
                     batch_absorbing = terminations.reshape(-1)
-                    batch_expert_next_states = expert_next_states[expert_idx]
                     batch_expert_absorbing = expert_absorbing[expert_idx]
+
+                    # k-step windows for the BYOL loss: actions a_t..a_{t+k-1}, next states s_{t+1}..s_{t+k} (same order as batch_states)
+                    batch_action_windows, batch_next_states_windows, batch_valid, batch_weights = agent_windows(actions, next_states, dones, self.prediction_steps)
+                    batch_expert_actions_windows, batch_expert_next_states_windows, batch_expert_valid, batch_expert_weights = expert_windows(expert_actions, expert_next_states, expert_absorbing, expert_idx, self.prediction_steps)
 
                     combined_learning_iteration_step = (multi_learning_iteration_step * self.nr_updates_per_multi_learning_iteration) + learning_iteration_step + 1
                     global_step = combined_learning_iteration_step * self.nr_steps * self.nr_envs
                     encoder_switch = jnp.where(global_step < self.warmup_env_steps, 0.0, 1.0)
 
-                    vmap_trirl_loss_fn = jax.vmap(trirl_loss_fn, in_axes=(None, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, None), out_axes=0)
+                    vmap_trirl_loss_fn = jax.vmap(trirl_loss_fn, in_axes=(None, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, None), out_axes=0)
                     safe_mean = lambda x: jnp.mean(x) if x is not None else x
                     mean_vmapped_trirl_loss_fn = lambda *a, **k: tree.map_structure(safe_mean, vmap_trirl_loss_fn(*a, **k))
                     grad_trirl_loss_fn = jax.value_and_grad(mean_vmapped_trirl_loss_fn, argnums=(0), has_aux=True)
@@ -482,9 +521,13 @@ class TRIRL_PPO:
                             batch_expert_actions[minibatch_indices_disc],
                             rollout_labels[minibatch_indices_disc],
                             expert_labels[minibatch_indices_disc],
-                            batch_next_states[minibatch_indices_disc],
+                            batch_action_windows[minibatch_indices_disc],
+                            batch_next_states_windows[minibatch_indices_disc],
+                            batch_weights[minibatch_indices_disc],
                             batch_absorbing[minibatch_indices_disc],
-                            batch_expert_next_states[minibatch_indices_disc],
+                            batch_expert_actions_windows[minibatch_indices_disc],
+                            batch_expert_next_states_windows[minibatch_indices_disc],
+                            batch_expert_weights[minibatch_indices_disc],
                             batch_expert_absorbing[minibatch_indices_disc],
                             encoder_switch,
                         )
@@ -719,6 +762,8 @@ class TRIRL_PPO:
 
                     # Logging
                     combined_metrics = {**infos, **disc_optimization_metrics, **ppo_optimization_metrics}
+                    if self.curriculum_success:
+                        combined_metrics["env/success_threshold"] = env_state.success_threshold
                     combined_metrics = tree.map_structure(lambda x: jnp.mean(x), combined_metrics)
 
                     def callback(carry):
@@ -765,6 +810,9 @@ class TRIRL_PPO:
                     key, reset_key = jax.random.split(key)
                     reset_keys = jax.random.split(reset_key, self.nr_envs)
                     eval_env_state = self.eval_env.reset(reset_keys, True)
+                    if self.curriculum_success:
+                        # Fixed final threshold, so eval/episode_return and the best-model choice are comparable over training
+                        eval_env_state = eval_env_state.replace(success_threshold=jnp.full_like(eval_env_state.success_threshold, self.final_success_threshold))
                     single_eval_rollout_carry, _ = jax.lax.scan(single_eval_rollout, (policy_state, eval_env_state), jnp.arange(self.horizon))
                     _, eval_env_state = single_eval_rollout_carry
 
@@ -793,23 +841,8 @@ class TRIRL_PPO:
 
                 # Saving
                 if self.save_model:
-                    # best = lowest deterministic eval task error (pos+orient)
-                    # eval_task_err_for_save = (eval_metrics["eval/task_err"]
-                    #                           if self.evaluation_active else jnp.asarray(jnp.inf))
                     eval_return_for_save = (eval_metrics["eval/episode_return"]
                                             if self.evaluation_active else jnp.asarray(-jnp.inf))
-
-                    #eval_task_err_for_save = jnp.zeros(self.nr_envs)
-                    # def save_with_check(policy_state, critic_state, discriminator_state, corrected_reward_state, eval_task_err):
-                    #     self.save(policy_state, critic_state, discriminator_state, corrected_reward_state)  # latest.model
-                    #     if self.evaluation_active:
-                    #         te = float(np.asarray(eval_task_err).reshape(-1)[0])
-                    #         if te < self.best_eval_task_err:
-                    #             self.best_eval_task_err = te
-                    #             self.save(policy_state, critic_state, discriminator_state, corrected_reward_state,
-                    #                       file_name=self.best_model_file_name)
-                    #             rlx_logger.info(f"[save-best] new best eval/task_err={te:.4f} -> {self.best_model_file_name}")
-                    # jax.debug.callback(save_with_check, policy_state, critic_state, discriminator_state, corrected_reward_state, eval_task_err_for_save)
 
                     def save_with_check(policy_state, critic_state, discriminator_state, corrected_reward_state,
                                         eval_return):

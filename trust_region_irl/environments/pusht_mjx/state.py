@@ -15,3 +15,4 @@ class State:
     info: Dict[str, Any]
     info_episode_store: Dict[str, Any]
     key: jax.random.PRNGKey
+    success_threshold: jax.Array  # traced, so the training loop can change it (success-threshold curriculum)

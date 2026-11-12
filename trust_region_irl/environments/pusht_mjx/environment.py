@@ -282,12 +282,13 @@ class PushT:
             "env_info/orient_err": 0.0,
             "env_info/is_success": 0.0,
             "env_info/reward_dist": 0.0,
+            "env_info/reward_orient": 0.0,
             "env_info/reward_ctrl": 0.0,
             "env_info/diverged": 0.0,
         }
         info_episode_store = {"episode_return": 0.0, "episode_length": 0}
         state = State(data, next_observation, next_observation, 0.0, False, False,
-                      info, info_episode_store, key)
+                      info, info_episode_store, key, jnp.float32(self.success_threshold))
         return self._reset(state)
 
     @partial(jax.vmap, in_axes=(None, 0, None))
@@ -363,7 +364,7 @@ class PushT:
 
         state.info_episode_store["episode_length"] += 1
         next_observation = self.get_observation(obs_data)
-        reward, r_info = self.get_reward(obs_data, action)
+        reward, r_info = self.get_reward(obs_data, action, state.success_threshold)
         terminated = r_info["env_info/is_success"] > 0.5
         # divergence guard: block left a sane region (huge-finite) or state went
         # NaN -> end the episode so it resets instead of accumulating garbage.
@@ -434,9 +435,10 @@ class PushT:
         orn_err = jnp.clip(jnp.nan_to_num(orn_err, nan=jnp.pi, posinf=jnp.pi), 0.0, jnp.pi)
         return pos_err, orn_err
 
-    def get_reward(self, data, action):
+    def get_reward(self, data, action, success_threshold):
+        # success_threshold comes from the state (not self.success_threshold), so the training loop can change it
         pos_err, orn_err = self._goal_errors(data)
-        is_success = ((pos_err < self.success_threshold) and (orn_err < self.success_threshold)).astype(jnp.float32)
+        is_success = ((pos_err < success_threshold) & (orn_err < success_threshold)).astype(jnp.float32)
 
         reward_dist = -pos_err
         reward_orient = -orn_err
@@ -444,7 +446,7 @@ class PushT:
         if self.reward_style == "sparse":
             reward = jnp.where(is_success > 0.5, 1.0, 0.0)
         else:
-            reward = -(30.0 * pos_err + 3.0 * orn_err + 0.005 * ee_block)
+            reward = -(pos_err + orn_err)
         # explicit bounded neginf (default is ~-3.4e38) so a future reward-sign
         # change can't reintroduce a huge-negative leak into the critic
         reward = jnp.nan_to_num(reward, nan=0.0, posinf=0.0, neginf=-10.0)

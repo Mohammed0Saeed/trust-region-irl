@@ -61,6 +61,14 @@ class BYOL(nn.Module):
 
         return p
 
+    def _multi_step_prediction(self, y, actions, next_states):
+        p = self._online_predictor(y, actions[0])
+        for a in actions[1:]:
+            p = jnp.concatenate((p, self._online_predictor(p, a)), axis=-1)
+
+        return p
+
+
     def _target_encoder(self, x):
         z = self.target_enc1(x)
         z = self.target_enc_norm(z)
@@ -103,3 +111,22 @@ class BYOL(nn.Module):
         y_target = self._target_network(x_next)
 
         return z, p_online, y_target
+
+    def multi_step_byol(self, x, actions, next_states):
+        # Online: encode s_t once, then chain the predictor through the k actions
+        z = self._online_encoder(x)
+        y = self._online_projector(z)
+
+        p = self._online_predictor(y, actions[0])
+        ps = [p]
+        for a in actions[1:]:
+            p = self._online_predictor(p, a)
+            ps.append(p)
+        ps = jnp.stack(ps)  # (k, 128)
+
+        # Target: embed the k real future states in one call
+        y_targets = self._target_network(next_states)  # (k, 128)
+
+        return z, ps, y_targets
+
+

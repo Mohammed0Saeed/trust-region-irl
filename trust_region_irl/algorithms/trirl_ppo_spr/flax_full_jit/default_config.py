@@ -44,6 +44,7 @@ def get_config(algorithm_name):
     config.pretrain_env_steps = 50e6 # Environment steps of encoder-only pre-training before TRIRL (not counted in total_timesteps)
     config.warmup_env_steps = 0 # TRIRL steps during which the discriminator loss does not train the encoder
     config.w_disc_loss = 1.0
+    config.prediction_steps = 1
 
     config.handle_absorbing_states = True
     config.reward_type = 'byol-observation-based'
