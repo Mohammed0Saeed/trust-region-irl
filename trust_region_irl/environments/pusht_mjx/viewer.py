@@ -12,6 +12,8 @@ class MujocoViewer:
         self.nr_presets = nr_presets
         self.preset = None
         self.preset_changed = False
+        # Random T pose selected with T: a new random pose now and at every new episode, until a preset or 0 is picked.
+        self.random_pose = False
 
         self.button_left, self.button_right, self.button_middle = False, False, False
         self.last_x, self.last_y = 0, 0
@@ -103,12 +105,19 @@ class MujocoViewer:
             self.run_speed_factor *= 2.0
         elif key == glfw.KEY_R and self.nr_presets > 0:
             self.preset = 0 if self.preset is None else (self.preset + 1) % self.nr_presets
+            self.random_pose = False
             self.preset_changed = True
         elif glfw.KEY_1 <= key <= glfw.KEY_9 and key - glfw.KEY_1 < self.nr_presets:
             self.preset = key - glfw.KEY_1
+            self.random_pose = False
             self.preset_changed = True
         elif key == glfw.KEY_0 and self.nr_presets > 0:
             self.preset = None
+            self.random_pose = False
+            self.preset_changed = True
+        elif key == glfw.KEY_T:
+            self.preset = None
+            self.random_pose = True
             self.preset_changed = True
 
 
@@ -181,8 +190,14 @@ class MujocoViewer:
         self.overlay[topleft][0] += "Camera mode:\n"
         self.overlay[topleft][1] += self.camera_mode+"\n"
         if self.nr_presets > 0:
-            self.overlay[topleft][0] += "Block preset ([R] next, [1-%d] pick, [0] env default):\n" % self.nr_presets
-            self.overlay[topleft][1] += ("env default" if self.preset is None else "%d / %d" % (self.preset + 1, self.nr_presets)) + "\n"
+            self.overlay[topleft][0] += "Block preset ([R] next, [1-%d] pick, [0] env default, [T] random):\n" % self.nr_presets
+            if self.random_pose:
+                block_mode = "random"
+            elif self.preset is None:
+                block_mode = "env default"
+            else:
+                block_mode = "%d / %d" % (self.preset + 1, self.nr_presets)
+            self.overlay[topleft][1] += block_mode + "\n"
         self.overlay[topleft][0] += "Run speed = %.3f x real time" % self.run_speed_factor
         self.overlay[topleft][1] += "[S]lower, [F]aster"
 

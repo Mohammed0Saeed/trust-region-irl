@@ -3,6 +3,9 @@ import jax.numpy as jnp
 from flax.linen.initializers import constant, orthogonal
 
 class BYOL(nn.Module):
+    # Input indices to select what observations to feed into the networks
+    input_indices: tuple = ()
+
     def setup(self):
         # Online Encoder Layers
         self.online_enc1 = nn.Dense(256, kernel_init=orthogonal(1.0), bias_init=constant(0.0))
@@ -33,6 +36,17 @@ class BYOL(nn.Module):
 
         # Reward Parameters
         self.theta = self.param("theta", constant(0.001), (64,))
+
+    def input(self, x):
+        """
+        Chooses the needed observations from the environment
+        If empty, the 24D observation will be fed to the networks
+        If not empty, the chosen indices will be fed to the networks
+        """
+        if len(self.input_indices) == 0:
+            return x
+        else:
+            return x[..., jnp.array(self.input_indices)]
 
     def _online_encoder(self, x):
         z = self.online_enc1(x)
@@ -88,6 +102,7 @@ class BYOL(nn.Module):
         return y
 
     def _online_network(self, x, a):
+        x = self.input(x)
         z = self._online_encoder(x)
         y = self._online_projector(z)
         p = self._online_predictor(y,a)
@@ -95,6 +110,7 @@ class BYOL(nn.Module):
         return z, p
 
     def _target_network(self, x):
+        x = self.input(x)
         z = self._target_encoder(x)
         y = self._target_projector(z)
 
@@ -113,6 +129,8 @@ class BYOL(nn.Module):
         return z, p_online, y_target
 
     def multi_step_byol(self, x, actions, next_states):
+        x = self.input(x)
+
         # Online: encode s_t once, then chain the predictor through the k actions
         z = self._online_encoder(x)
         y = self._online_projector(z)

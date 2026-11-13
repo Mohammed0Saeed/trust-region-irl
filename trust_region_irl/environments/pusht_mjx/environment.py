@@ -297,17 +297,68 @@ class PushT:
         """Reset every env to block preset `preset_idx`, keeping the state's pytree structure (used by render)."""
         return self._reset(state, preset_idx)
 
+    @partial(jax.vmap, in_axes=(None, 0))
     @partial(jax.jit, static_argnums=(0,))
-    def _reset(self, state, preset_idx=None):
-        if preset_idx is not None or self.random_TPos:
-            key = state.key
-            if preset_idx is None:
-                key, t_pos_key = jax.random.split(state.key, 2)
-                preset_idx = jax.random.randint(t_pos_key, shape=(), minval=0, maxval=6)
-            idx = preset_idx
+    def reset_to_random(self, state):
+        """Reset every env to a random safe T pose, even if random_TPos is off (used by render, key T)."""
+        return self._reset(state, force_random=True)
 
-            block_xy = self.preset_block_poses[idx][0:2]
-            block_angle = self.preset_block_poses[idx][2]
+    @partial(jax.jit, static_argnums=(0,), static_argnames=("force_random",))
+    def _reset(self, state, preset_idx=None, force_random=False):
+        if preset_idx is not None or self.random_TPos or force_random:
+            key = state.key
+
+            if preset_idx is not None:
+                # Fixed preset pose (used by the viewer / render)
+                block_xy = self.preset_block_poses[preset_idx][0:2]
+                block_angle = self.preset_block_poses[preset_idx][2]
+
+            else:
+                SPAWN_RADIUS = 0.15  # m, maximum distance of the T origin from the goal
+                EE_SPHERE_RADIUS = 0.015 # m, geom "ee" on body ee_frame
+                EE_CLEARANCE = 0.02 # m, minimum gap between the T surface and the end-effector sphere
+                MAX_TRIES = 32 # redraws before falling back to a known-safe pose
+
+                # T in its own frame: centres and half sizes of the "bottom" and "top" boxes (scene_mjx_free.xml)
+                t_box_centres = jnp.array([[0.0, 0.0], [0.075, 0.0]], dtype=jnp.float32)
+                t_box_half_sizes = jnp.array([[0.05, 0.025], [0.025, 0.06]], dtype=jnp.float32)
+
+                ee_xy = jnp.array(self.GOAL_POS_EE[0:2], dtype=jnp.float32)
+                goal_xy = self.goal_pos[0:2]
+                min_distance = EE_SPHERE_RADIUS + EE_CLEARANCE
+
+                def ee_to_t_distance(xy, angle):
+                    # Distance in the table plane from the end-effector centre to the T surface (0 if inside)
+                    d = ee_xy - xy
+                    c, s = jnp.cos(angle), jnp.sin(angle)
+                    p = jnp.array([c * d[0] + s * d[1], -s * d[0] + c * d[1]])  # end effector in the T frame
+                    outside = jnp.maximum(jnp.abs(p - t_box_centres) - t_box_half_sizes, 0.0)
+                    return jnp.min(jnp.linalg.norm(outside, axis=-1))
+
+                def draw(key):
+                    key, k_r, k_phi, k_angle = jax.random.split(key, 4)
+                    rho = SPAWN_RADIUS * jnp.sqrt(jax.random.uniform(k_r))  # sqrt -> uniform over the disk area
+                    phi = jax.random.uniform(k_phi, minval=0.0, maxval=2 * jnp.pi)
+                    xy = goal_xy + rho * jnp.array([jnp.cos(phi), jnp.sin(phi)])
+                    angle = jax.random.uniform(k_angle, minval=0.0, maxval=2 * jnp.pi)
+                    return key, xy, angle
+
+                def unsafe(carry):
+                    _, xy, angle, tries = carry
+                    return (ee_to_t_distance(xy, angle) < min_distance) & (tries < MAX_TRIES)
+
+                def redraw(carry):
+                    key, _, _, tries = carry
+                    key, xy, angle = draw(key)
+                    return key, xy, angle, tries + 1
+
+                key, block_xy, block_angle = draw(key)
+                key, block_xy, block_angle, _ = jax.lax.while_loop(unsafe, redraw, (key, block_xy, block_angle, 0))
+
+                # Fallback if every try was unsafe: preset 0 (the dataset start pose), known to be safe
+                safe = ee_to_t_distance(block_xy, block_angle) >= min_distance
+                block_xy = jnp.where(safe, block_xy, self.preset_block_poses[0][0:2])
+                block_angle = jnp.where(safe, block_angle, self.preset_block_poses[0][2])
 
             half_angle = block_angle * 0.5
             block_quat = jnp.array([jnp.cos(half_angle), 0.0, 0.0, jnp.sin(half_angle)])
@@ -462,13 +513,17 @@ class PushT:
         return reward, info
 
     def render(self, state):
-        # Apply a block preset picked in the viewer, and re-apply it whenever an episode auto-resets.
+        # Apply a block preset (or random pose, key T) picked in the viewer, and re-apply it whenever an episode auto-resets.
         preset = self.viewer.preset
+        random_pose = self.viewer.random_pose
         new_episode = int(np.asarray(state.info_episode_store["episode_length"])[0]) == 0
-        if self.viewer.preset_changed or (preset is not None and new_episode):
+        if self.viewer.preset_changed or ((preset is not None or random_pose) and new_episode):
             self.viewer.preset_changed = False
-            # None falls back to the env's own choice (random preset if random_TPos, else the default pose)
-            state = self.reset_to_preset(state, None if preset is None else jnp.int32(preset))
+            if random_pose:
+                state = self.reset_to_random(state)
+            else:
+                # None falls back to the env's own choice (random pose if random_TPos, else the default pose)
+                state = self.reset_to_preset(state, None if preset is None else jnp.int32(preset))
         env_id = 0
         data = mjx.get_data(self.mj_model, state.data)[env_id]
         data.light_xdir = self.light_xdir

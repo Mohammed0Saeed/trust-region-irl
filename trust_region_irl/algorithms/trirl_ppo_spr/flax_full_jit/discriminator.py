@@ -12,6 +12,9 @@ def get_discriminator(config, env, reward_type='feature-based'):
     if action_space_type == ActionSpaceType.CONTINUOUS and observation_space_type == ObservationSpaceType.FLAT_VALUES:
         if reward_type == 'byol-observation-based':
             return BYOL()
+        elif reward_type == 'byol-task-based-observation':
+            # T position [0, 1, 2], T quaternion [3, 4, 5, 6]
+            return BYOL(input_indices=(0, 1, 2, 3, 4, 5, 6))
         else:
             raise NotImplementedError
 
