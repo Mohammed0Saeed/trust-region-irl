@@ -314,7 +314,7 @@ class PushT:
                 block_angle = self.preset_block_poses[preset_idx][2]
 
             else:
-                SPAWN_RADIUS = 0.15  # m, maximum distance of the T origin from the goal
+                SPAWN_RADIUS = 0.20  # m, maximum distance of the T origin from the goal
                 EE_SPHERE_RADIUS = 0.015 # m, geom "ee" on body ee_frame
                 EE_CLEARANCE = 0.02 # m, minimum gap between the T surface and the end-effector sphere
                 MAX_TRIES = 32 # redraws before falling back to a known-safe pose

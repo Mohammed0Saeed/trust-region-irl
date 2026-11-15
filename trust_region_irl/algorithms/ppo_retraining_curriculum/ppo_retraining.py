@@ -14,9 +14,10 @@ import orbax.checkpoint
 import optax
 import wandb
 
-from rl_x.algorithms.ppo.flax_full_jit.general_properties import GeneralProperties
-from rl_x.algorithms.ppo.flax_full_jit.policy import get_policy
-from rl_x.algorithms.ppo.flax_full_jit.critic import get_critic
+# Same policy and critic as trirl_ppo_spr (the local copies are identical to it)
+from trust_region_irl.algorithms.ppo_retraining_curriculum.general_properties import GeneralProperties
+from trust_region_irl.algorithms.ppo_retraining_curriculum.policy import get_policy
+from trust_region_irl.algorithms.ppo_retraining_curriculum.critic import get_critic
 
 from trust_region_irl.algorithms.ppo_retraining.ppo_retraining import PPO_RETRAINING
 
@@ -41,7 +42,9 @@ class PPO_RETRAINING_CURRICULUM:
         self.eval_env = eval_env
         self.writer = writer
 
-        self.save_model = config.runner.save_model
+        # Retraining always saves its policy (best.model / latest.model), so evaluate_model.py --retrained can load it.
+        # config.runner.save_model can't be used: the runner refuses it in test mode, which retraining runs in.
+        self.save_model = True
         self.save_path = os.path.join(run_path, "models")
         self.track_console = config.runner.track_console
         self.track_tb = config.runner.track_tb
@@ -76,31 +79,52 @@ class PPO_RETRAINING_CURRICULUM:
         self.as_shape = self.train_env.single_action_space.shape
         self.horizon = self.train_env.horizon
 
+        # PPO as in trirl_ppo, without the reward correction: trust-region (KL) loss and absorbing-state handling
+        self.init_eta = config.algorithm.init_eta
+        self.const_eta = config.algorithm.const_eta
+        self.handle_absorbing_states = config.algorithm.handle_absorbing_states
+        self.env_reward_frac = config.algorithm.env_reward_frac
+        self.H_terminal = jnp.sum(jnp.log(self.train_env.single_action_space.high - self.train_env.single_action_space.low))
+
+        # Success-threshold curriculum, same as trirl_ppo (only when environment.curriculum_success=True)
+        self.curriculum_success = config.environment.get("curriculum_success", False)
+        if self.curriculum_success:
+            threshold_values = [float(v) for v in config.environment.success_threshold_values.split(",")]
+            threshold_fractions = [float(f) for f in config.environment.success_threshold_fractions.split(",")]
+            if len(threshold_values) != len(threshold_fractions):
+                raise ValueError("success_threshold_values and success_threshold_fractions must have the same number of entries")
+            if abs(sum(threshold_fractions) - 1.0) > 1e-6:
+                raise ValueError(f"success_threshold_fractions must sum to 1, got {sum(threshold_fractions)}")
+            self.success_threshold_values = jnp.array(threshold_values, dtype=jnp.float32)
+            # Env step at which each threshold after the first one starts
+            self.success_threshold_boundaries = jnp.array(np.cumsum(threshold_fractions)[:-1] * self.total_timesteps, dtype=jnp.float32)
+            self.final_success_threshold = threshold_values[-1]  # evaluation always uses the final threshold
+
         # Use the saved reward function
         self.reward_function = reward_function
 
-        # Determine the correct directory to look for theta_matrix.npy
-        if hasattr(config.runner, "load_model") and config.runner.load_model:
-            # Look in the folder of the model you are loading
-            model_folder = os.path.dirname(config.runner.load_model)
-        else:
-            # Fallback to the current run's save folder (e.g., run_path/models)
-            model_folder = self.save_path
-
-        theta_path = os.path.join(model_folder, "theta_matrix.npy")
-
-        # Upload the thetas
+        # Fixed reward theta (no theta curriculum): the corrected-reward theta stored in the loaded TRIRL checkpoint,
+        # so theta and the encoder of the reward come from the same point of TRIRL training
+        if not (hasattr(config.runner, "load_model") and config.runner.load_model):
+            raise ValueError("runner.load_model must point to a TRIRL checkpoint to read the reward theta from")
+        checkpoint_path = os.path.abspath(config.runner.load_model)
+        self.reward_model_path = checkpoint_path  # written next to the saved policy (retraining_info.json)
+        unpack_dir = os.path.join(os.path.dirname(checkpoint_path), "tmp_reward_theta")
+        if os.path.exists(unpack_dir):
+            shutil.rmtree(unpack_dir)
+        shutil.unpack_archive(checkpoint_path, unpack_dir, "zip")
         try:
-            # Add jnp.array() around the loaded numpy array
-            self.thetas = jnp.array(np.load(theta_path))
-            self.nr_thetas = self.thetas.shape[0]
-            rlx_logger.info(f"Loaded {self.nr_thetas} thetas from {theta_path} for Curriculum Learning.")
-        except Exception as e:
-            rlx_logger.error(f"Runtime Error: the thetas weren't found. Exception: {e}")
-            raise FileNotFoundError(f"Missing theta matrix")
-
-        self.nr_thetas = self.thetas.shape[0]
-        rlx_logger.info(f"Loaded {self.nr_thetas} thetas from {theta_path} for Curriculum Learning.")
+            # Restore every leaf as a numpy array (no target tree is available here)
+            checkpointer = orbax.checkpoint.PyTreeCheckpointer()
+            metadata = checkpointer.metadata(unpack_dir)
+            metadata = getattr(metadata, "item_metadata", metadata)
+            metadata = getattr(metadata, "tree", metadata)
+            restore_args = jax.tree_util.tree_map(lambda _: orbax.checkpoint.RestoreArgs(restore_type=np.ndarray), metadata)
+            checkpoint = checkpointer.restore(unpack_dir, restore_args=restore_args)
+            self.theta = jnp.array(np.asarray(checkpoint["corrected_reward"]["params"]["params"]["theta"]))
+        finally:
+            shutil.rmtree(unpack_dir)
+        rlx_logger.info(f"Loaded the corrected-reward theta (shape {self.theta.shape}) from {checkpoint_path}.")
 
         if self.evaluation_and_save_frequency % self.batch_size != 0:
             raise ValueError("Evaluation and save frequency must be a multiple of batch size")
@@ -168,22 +192,15 @@ class PPO_RETRAINING_CURRICULUM:
                     policy_state, critic_state, env_state, key = learning_iteration_carry
 
                     current_global_iteration = (multi_learning_iteration_step * self.nr_updates_per_multi_learning_iteration) + learning_iteration_step
-                    total_iterations = self.nr_multi_learning_and_eval_save_iterations * self.nr_updates_per_multi_learning_iteration
 
-                    # 0.0 at the start of training, 1.0 at the end
-                    progress_fraction = current_global_iteration / jnp.maximum(1, total_iterations - 1)
+                    # Fixed reward theta for the whole training (no theta curriculum)
+                    current_theta = self.theta
 
-                    # Map fraction to an index in the theta matrix (e.g. 0 to N-1)
-                    continuous_idx = progress_fraction * (self.nr_thetas - 1)
-
-                    idx_low = jnp.floor(continuous_idx).astype(jnp.int32)
-                    idx_high = jnp.ceil(continuous_idx).astype(jnp.int32)
-                    alpha = continuous_idx - idx_low
-
-                    # Linearly interpolate between the two nearest thetas
-                    theta_low = self.thetas[idx_low]
-                    theta_high = self.thetas[idx_high]
-                    current_theta = (1.0 - alpha) * theta_low + alpha * theta_high
+                    # Success-threshold curriculum: pick the threshold from the env steps done before this rollout
+                    if self.curriculum_success:
+                        steps_done = current_global_iteration * self.batch_size
+                        stage = jnp.searchsorted(self.success_threshold_boundaries, steps_done, side="right")
+                        env_state = env_state.replace(success_threshold=jnp.full_like(env_state.success_threshold, self.success_threshold_values[stage]))
 
                     # Acting
                     def single_rollout(single_rollout_carry, _):
@@ -200,7 +217,7 @@ class PPO_RETRAINING_CURRICULUM:
                         value = self.critic.apply(critic_state.params, observation).squeeze(-1)
                         env_state = self.train_env.step(env_state, processed_action)
                         transition = (observation, env_state.actual_next_observation, action, env_state.reward, value,
-                                      env_state.terminated, log_prob, env_state.info)
+                                      env_state.terminated, log_prob, action_mean, env_state.info)
 
                         if self.render:
                             def render(env_state):
@@ -210,13 +227,22 @@ class PPO_RETRAINING_CURRICULUM:
 
                         return (policy_state, critic_state, env_state, key), transition
 
-                    single_rollout_carry, batch = jax.lax.scan(single_rollout, learning_iteration_carry, None,
+                    # Start from env_state (not learning_iteration_carry) so the curriculum threshold set above is used
+                    single_rollout_carry, batch = jax.lax.scan(single_rollout, (policy_state, critic_state, env_state, key), None,
                                                                self.nr_steps)
                     policy_state, critic_state, env_state, key = single_rollout_carry
-                    states, next_states, actions, rewards, values, terminations, log_probs, infos = batch
+                    states, next_states, actions, env_rewards, values, terminations, log_probs, old_action_means, infos = batch
 
-                    # Use learnt reward
-                    rewards = self.reward_function(current_theta, states, actions, next_states, terminations, log_probs)
+                    # Learnt reward (already scaled by entropy_coef in the reward function), no reward correction
+                    learnt_rewards = self.reward_function(current_theta, states, actions, next_states, terminations, log_probs)
+                    if self.handle_absorbing_states:
+                        # Reward of the absorbing state, evaluated at the next state (as in trirl_ppo)
+                        learnt_rewards_absorbing_state = self.reward_function(current_theta, next_states, actions, next_states, terminations, log_probs)
+                    else:
+                        learnt_rewards_absorbing_state = jnp.asarray(0.0)
+
+                    rewards = self.env_reward_frac * env_rewards + (1 - self.env_reward_frac) * learnt_rewards
+                    rewards_absorbing_state = (1 - self.env_reward_frac) * learnt_rewards_absorbing_state  # the environment pays no reward in the absorbing state
 
                     # Calculating advantages and returns
                     def calculate_gae_advantages(critic_state, next_states, rewards, values, terminations):
@@ -234,11 +260,44 @@ class PPO_RETRAINING_CURRICULUM:
                         returns = advantages + values
                         return advantages, returns
 
-                    advantages, returns = calculate_gae_advantages(critic_state, next_states, rewards, values,
-                                                                   terminations)
+                    def calculate_gae_advantages_absorbing(critic_state, next_states, rewards, rewards_next_state, values, terminations):
+                        """
+                        Correctly handle absorbing state value and entropy (instead of setting to 0.0)
+                        """
+                        def compute_advantages(carry, t):
+                            prev_advantage = carry[0]
+                            advantage = delta[t] + self.gamma * self.gae_lambda * (1 - terminations[t]) * prev_advantage
+                            return (advantage,), advantage
+
+                        next_values = self.critic.apply(critic_state.params, next_states).squeeze(-1)
+                        terminal_tail = (self.gamma / (1.0 - self.gamma)) * (rewards_next_state + self.entropy_coef * self.H_terminal)
+                        delta = rewards + self.gamma * next_values * (1.0 - terminations) + (terminations * terminal_tail) - values
+                        init_advantages = delta[-1]
+                        _, advantages = jax.lax.scan(compute_advantages, (init_advantages,),
+                                                     jnp.arange(self.nr_steps - 2, -1, -1))
+                        advantages = jnp.concatenate([advantages[::-1], jnp.array([init_advantages])])
+                        returns = advantages + values
+                        return advantages, returns
+
+                    if self.handle_absorbing_states:
+                        advantages, returns = calculate_gae_advantages_absorbing(critic_state, next_states, rewards, rewards_absorbing_state, values, terminations)
+                    else:
+                        advantages, returns = calculate_gae_advantages(critic_state, next_states, rewards, values, terminations)
+
+                    # Compute eta (linear schedule), as in trirl_ppo
+                    global_step = (current_global_iteration + 1) * self.batch_size
+
+                    def linear_schedule_eta(global_step):
+                        if self.const_eta:
+                            return self.init_eta
+                        else:
+                            fraction = 1.0 - jnp.clip(global_step, min=None, max=self.total_timesteps) / self.total_timesteps
+                            return self.init_eta * fraction
+
+                    eta = linear_schedule_eta(global_step)
 
                     # Optimizing
-                    def loss_fn(policy_params, critic_params, state_b, action_b, log_prob_b, return_b, advantage_b):
+                    def loss_fn(policy_params, critic_params, state_b, action_b, log_prob_b, return_b, advantage_b, old_mean_b, old_logstd_b, eta):
                         # Policy loss
                         action_mean, action_logstd = self.policy.apply(policy_params, state_b)
                         action_std = jnp.exp(action_logstd)
@@ -263,27 +322,43 @@ class PPO_RETRAINING_CURRICULUM:
                         new_value = self.critic.apply(critic_params, state_b)
                         critic_loss = 0.5 * (new_value - return_b) ** 2
 
+                        # Trust Region Loss
+                        # Analytical KL (across all samples)
+                        old_logstd_b = jnp.expand_dims(old_logstd_b, 0)  # shape (1, as_shape)
+                        old_action_std = jnp.exp(old_logstd_b)
+                        tr_loss_maha = 0.5 * jnp.sum(((old_mean_b - action_mean) / old_action_std) ** 2, axis=1)
+                        tr_loss_cov_part = 0.5 * jnp.sum(2.0 * (jnp.log(old_action_std) - jnp.log(action_std)) + (action_std / old_action_std) ** 2 - 1.0, axis=1)
+                        trust_region_loss = tr_loss_maha + tr_loss_cov_part
+
                         # Combine losses
-                        loss = pg_loss - self.entropy_coef * entropy_loss + self.critic_coef * critic_loss
+                        loss = pg_loss - self.entropy_coef * entropy_loss + self.critic_coef * critic_loss + eta * trust_region_loss
 
                         # Create metrics
                         metrics = {
                             "loss/policy_gradient_loss": pg_loss,
                             "loss/critic_loss": critic_loss,
                             "loss/entropy_loss": entropy_loss,
+                            "loss/trust_region_loss": trust_region_loss,
                             "policy_ratio/approx_kl": approx_kl_div,
                             "policy_ratio/clip_fraction": clip_fraction,
                         }
 
                         return loss, (metrics)
 
+                    # Gradients must only flow through the predicted ones.
+                    # The log standard deviation is a state-independent parameter, so the rollout's value is the
+                    # parameter before this update (shape (1, as_shape) -> (as_shape,))
+                    old_action_means = jax.lax.stop_gradient(old_action_means)
+                    old_action_logstd = jax.lax.stop_gradient(policy_state.params["params"]["policy_logstd"])[0]
+
                     batch_states = states.reshape((-1,) + self.os_shape)
                     batch_actions = actions.reshape((-1,) + self.as_shape)
                     batch_advantages = advantages.reshape(-1)
                     batch_returns = returns.reshape(-1)
                     batch_log_probs = log_probs.reshape(-1)
+                    batch_action_means = old_action_means.reshape((-1,) + self.as_shape)
 
-                    vmap_loss_fn = jax.vmap(loss_fn, in_axes=(None, None, 0, 0, 0, 0, 0), out_axes=0)
+                    vmap_loss_fn = jax.vmap(loss_fn, in_axes=(None, None, 0, 0, 0, 0, 0, 0, None, None), out_axes=0)
                     safe_mean = lambda x: jnp.mean(x) if x is not None else x
                     mean_vmapped_loss_fn = lambda *a, **k: tree.map_structure(safe_mean, vmap_loss_fn(*a, **k))
                     grad_loss_fn = jax.value_and_grad(mean_vmapped_loss_fn, argnums=(0, 1), has_aux=True)
@@ -291,6 +366,7 @@ class PPO_RETRAINING_CURRICULUM:
                     key, subkey = jax.random.split(key)
                     batch_indices = jnp.tile(jnp.arange(self.batch_size), (self.nr_epochs, 1))
                     batch_indices = jax.random.permutation(subkey, batch_indices, axis=1, independent=True)
+                    batch_indices = batch_indices[:, :self.nr_minibatches * self.minibatch_size]
                     batch_indices = batch_indices.reshape((self.nr_epochs * self.nr_minibatches, self.minibatch_size))
 
                     def minibatch_update(carry, minibatch_indices):
@@ -307,7 +383,10 @@ class PPO_RETRAINING_CURRICULUM:
                             batch_actions[minibatch_indices],
                             batch_log_probs[minibatch_indices],
                             batch_returns[minibatch_indices],
-                            minibatch_advantages
+                            minibatch_advantages,
+                            batch_action_means[minibatch_indices],
+                            old_action_logstd,
+                            eta
                         )
 
                         policy_state = policy_state.apply_gradients(grads=policy_gradients)
@@ -330,11 +409,14 @@ class PPO_RETRAINING_CURRICULUM:
                     optimization_metrics["policy/std_dev"] = jnp.mean(
                         jnp.exp(policy_state.params["params"]["policy_logstd"]))
 
-                    optimization_metrics["curriculum/progress_fraction"] = progress_fraction
-                    optimization_metrics["curriculum/theta_mean"] = jnp.mean(current_theta)
+                    optimization_metrics["correction/eta"] = eta
+                    optimization_metrics["reward/learnt_mean"] = jnp.mean(learnt_rewards)
+                    optimization_metrics["reward/learnt_std"] = jnp.std(learnt_rewards)
 
                     # Logging
                     combined_metrics = {**infos, **optimization_metrics}
+                    if self.curriculum_success:
+                        combined_metrics["env/success_threshold"] = env_state.success_threshold
                     combined_metrics = tree.map_structure(lambda x: jnp.mean(x), combined_metrics)
 
                     def callback(carry):
@@ -383,6 +465,9 @@ class PPO_RETRAINING_CURRICULUM:
                     key, reset_key = jax.random.split(key)
                     reset_keys = jax.random.split(reset_key, self.nr_envs)
                     eval_env_state = self.eval_env.reset(reset_keys, True)
+                    if self.curriculum_success:
+                        # Fixed final threshold, so eval/episode_return and the best-model choice are comparable over training
+                        eval_env_state = eval_env_state.replace(success_threshold=jnp.full_like(eval_env_state.success_threshold, self.final_success_threshold))
                     single_eval_rollout_carry, _ = jax.lax.scan(single_eval_rollout, (policy_state, eval_env_state),
                                                                 jnp.arange(self.horizon))
                     _, eval_env_state = single_eval_rollout_carry
@@ -391,6 +476,9 @@ class PPO_RETRAINING_CURRICULUM:
                         "eval/episode_return": jnp.mean(eval_env_state.info["rollout/episode_return"]),
                         "eval/episode_length": jnp.mean(eval_env_state.info["rollout/episode_length"]),
                     }
+
+                    if "rollout/is_success" in eval_env_state.info:
+                        eval_metrics["eval/is_success"] = jnp.mean(eval_env_state.info["rollout/is_success"])
 
                     if "rollout/task_err" in eval_env_state.info:
                         eval_metrics["eval/task_err"] = jnp.mean(eval_env_state.info["rollout/task_err"])
@@ -477,6 +565,19 @@ class PPO_RETRAINING_CURRICULUM:
 
         with open(f"{self.save_path}/tmp/config_algorithm.json", "w") as f:
             json.dump(self.config.algorithm.to_dict(), f)
+
+        # Which TRIRL reward this policy was retrained on, and the threshold setup (read by evaluate_model.py --retrained)
+        retraining_info = {
+            "reward_model": self.reward_model_path,
+            "curriculum_success": bool(self.curriculum_success),
+            "success_threshold": float(self.config.environment.get("success_threshold", float("nan"))),
+            "success_threshold_values": self.config.environment.get("success_threshold_values", ""),
+            "success_threshold_fractions": self.config.environment.get("success_threshold_fractions", ""),
+        }
+        with open(f"{self.save_path}/tmp/retraining_info.json", "w") as f:
+            json.dump(retraining_info, f, indent=2)
+        with open(f"{self.save_path}/retraining_info.json", "w") as f:
+            json.dump(retraining_info, f, indent=2)
 
         # shutil.make_archive automatically appends '.zip' to the target file
         shutil.make_archive(f"{self.save_path}/{file_name}", "zip", f"{self.save_path}/tmp")
