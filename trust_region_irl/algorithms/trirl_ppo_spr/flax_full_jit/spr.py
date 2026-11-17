@@ -40,9 +40,15 @@ class Encoder(nn.Module):
     """f: 256, LN, 256, 64 (as in BYOL-S)"""
     latent_dim: int = 64
     hidden_dim: int = 256
+    input_mode: str = "full26"
 
     @nn.compact
     def __call__(self, x):
+        if self.input_mode != "full26":
+            if self.input_mode not in ("task12", "object9") or x.shape[-1] != 26:
+                raise ValueError("Restricted reward inputs require v3 26D observations")
+            keep = 12 if self.input_mode == "task12" else 9
+            x = x * (jnp.arange(26) < keep)  # preserve parameter shape; mask before ALL mixing
         z = _dense(self.hidden_dim)(x)
         z = nn.LayerNorm()(z)
         z = nn.relu(z)
@@ -104,15 +110,16 @@ class SPR(nn.Module):
     hidden_dim: int = 256
     transition_residual: bool = False
     num_steps: int = 5  # K, only used by "bilinear" (one W_k per step)
+    reward_input_mode: str = "full26"
 
     def setup(self):
         if self.predictor_mode not in PREDICTOR_MODES:
             raise ValueError(f"predictor_mode must be one of {PREDICTOR_MODES}, got '{self.predictor_mode}'")
-        self.online_encoder = Encoder(self.latent_dim, self.hidden_dim)
+        self.online_encoder = Encoder(self.latent_dim, self.hidden_dim, self.reward_input_mode)
         # Flax creates parameters only for modules that are called, so the modes without EMA / projector never get
         # target_* or *_projector parameters (and init_target_from_online / ema_update_target skip the missing pairs).
         self.online_projector = Projector(self.proj_dim, self.hidden_dim)
-        self.target_encoder = Encoder(self.latent_dim, self.hidden_dim)
+        self.target_encoder = Encoder(self.latent_dim, self.hidden_dim, self.reward_input_mode)
         self.target_projector = Projector(self.proj_dim, self.hidden_dim)
         if self.predictor_mode == "byol_s":
             self.predictor = MLPPredictor(self.proj_dim, self.hidden_dim)

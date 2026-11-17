@@ -11,6 +11,7 @@ def get_discriminator(config, env, reward_type='byol-observation-based'):
         if reward_type == 'byol-observation-based':
             return SPR(
                 predictor_mode=config.algorithm.predictor_mode,
+                reward_input_mode=config.algorithm.get("reward_input_mode", "full26"),
                 transition_residual=config.algorithm.spr_residual,
                 num_steps=int(config.algorithm.spr_k),
             )

@@ -6,6 +6,7 @@ def get_config(algorithm_name):
 
     config.name = algorithm_name
 
+    config.reward_input_mode = "full26"
     config.device = "gpu"  # cpu, gpu
     config.nr_parallel_seeds = 1
     config.total_timesteps = 2e9
