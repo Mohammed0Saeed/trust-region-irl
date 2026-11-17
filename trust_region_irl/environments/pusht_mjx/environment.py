@@ -84,6 +84,15 @@ class PushT:
                                      [0.50, -0.15,  jnp.pi / 4],
                                      [0.38,  0.00, -jnp.pi / 2]], dtype=jnp.float32)
 
+    # preset_set="paper": the six start poses of the paper (Table 1) and of the 600-demo expert dataset
+    # trirl_expert_data_100_episodes.npz (100 demos per start). x, y in m, yaw in rad (goal at (0.5, 0)).
+    paper_block_poses = jnp.array([[0.40, -0.10,  jnp.pi / 2],
+                                   [0.40, -0.05, -jnp.pi / 4],
+                                   [0.45, -0.15,  0.0],
+                                   [0.50,  0.20, -jnp.pi / 2],
+                                   [0.60,  0.05,  5 * jnp.pi / 4],
+                                   [0.65,  0.00,  jnp.pi]], dtype=jnp.float32)
+
     GOAL_POS_EE = np.array([0.45, 0.1, 0.035])
     GOAL_QUAT_EE = jnp.array([0.0, 0.7071, 0.7071, 0.0])  # wxyz
     MAX_SPEED = 0.35
@@ -102,8 +111,19 @@ class PushT:
     SINGULARITY_THRESHOLD = 0.05
 
     def __init__(self, render, horizon=250, reward_style="dense",
-                 success_threshold=0.1, feature_fn="base", random_TPos = False):
+                 success_threshold=0.1, feature_fn="base", random_TPos = False,
+                 eval_init_noise_xy=0.0, eval_init_noise_yaw=0.0, preset_set="legacy"):
         self.random_TPos = random_TPos
+        if preset_set not in ("legacy", "paper"):
+            raise ValueError(f"preset_set must be 'legacy' or 'paper', got '{preset_set}'")
+        self.preset_set = preset_set
+        if preset_set == "paper":
+            # instance attribute shadows the class attribute; with random_TPos=False the fixed start is preset 0
+            self.preset_block_poses = self.paper_block_poses
+        # Eval-only start perturbation (uniform, block xy in m / yaw in rad). With a fixed start, a
+        # deterministic policy and deterministic MJX, every eval episode would otherwise be identical.
+        self.eval_init_noise_xy = float(eval_init_noise_xy)
+        self.eval_init_noise_yaw = float(eval_init_noise_yaw)
         self.horizon = horizon
         self.reward_style = reward_style
         self.success_threshold = success_threshold
@@ -164,6 +184,10 @@ class PushT:
             feature_dim = 4  # [-pos_err, -orient_err, -ee_block_dist, -ctrl]
         elif self.feature_fn == "base_rbf":
             feature_dim = 7  # [-pos_err, -orient_err, -ee_block, pos_bump_tight, pos_bump_wide, ori_bump, goal_bump]
+        elif self.feature_fn == "base_without_ctrl":
+            feature_dim = 3
+        elif self.feature_fn == "pos_ort":
+            feature_dim = 2
         else:
             feature_dim = self.single_observation_space.shape[0]
         self.single_features_shape = BoxSpace(
@@ -270,9 +294,7 @@ class PushT:
         scale = jnp.minimum(1.0, jnp.min(self.joint_vel_limits / (jnp.abs(dq) + 1e-9)))
         return dq * scale
 
-    @partial(jax.vmap, in_axes=(None, 0, None))
-    @partial(jax.jit, static_argnums=(0, 2))
-    def reset(self, key, eval_mode):
+    def _blank_state(self, key):
         data = self.mjx_data
         next_observation = jnp.zeros(self.single_observation_space.shape, dtype=jnp.float32)
         info = {
@@ -286,9 +308,39 @@ class PushT:
             "env_info/diverged": 0.0,
         }
         info_episode_store = {"episode_return": 0.0, "episode_length": 0}
-        state = State(data, next_observation, next_observation, 0.0, False, False,
-                      info, info_episode_store, key)
-        return self._reset(state)
+        return State(data, next_observation, next_observation, 0.0, False, False,
+                     info, info_episode_store, key)
+
+    @partial(jax.vmap, in_axes=(None, 0, None))
+    @partial(jax.jit, static_argnums=(0, 2))
+    def reset(self, key, eval_mode):
+        state = self._reset(self._blank_state(key))
+        if eval_mode and (self.eval_init_noise_xy > 0.0 or self.eval_init_noise_yaw > 0.0):
+            state = self._perturb_block(state)
+        return state
+
+    @partial(jax.vmap, in_axes=(None, 0, 0, None))
+    @partial(jax.jit, static_argnums=(0, 3))
+    def reset_eval(self, key, preset_idx, perturb):
+        """Evaluation start: block at preset `preset_idx` (independent of random_TPos), optionally perturbed by
+        eval_init_noise_*. `key` only drives the perturbation."""
+        state = self._reset(self._blank_state(key), preset_idx)
+        if perturb and (self.eval_init_noise_xy > 0.0 or self.eval_init_noise_yaw > 0.0):
+            state = self._perturb_block(state)
+        return state
+
+    def _perturb_block(self, state):
+        """Shift the block xy and rotate it about the world z axis (eval-only start perturbation).
+        Only reset(..., eval_mode=True) calls this; training resets and auto-resets are unaffected."""
+        key, xy_key, yaw_key = jax.random.split(state.key, 3)
+        d_xy = jax.random.uniform(xy_key, (2,), minval=-self.eval_init_noise_xy, maxval=self.eval_init_noise_xy)
+        d_yaw = jax.random.uniform(yaw_key, (), minval=-self.eval_init_noise_yaw, maxval=self.eval_init_noise_yaw)
+        qpos = state.data.qpos
+        z_rotation = jnp.array([jnp.cos(0.5 * d_yaw), 0.0, 0.0, jnp.sin(0.5 * d_yaw)])
+        qpos = qpos.at[0:2].add(d_xy).at[3:7].set(_quat_mul(z_rotation, qpos[3:7]))
+        data = mjx.forward(self.mjx_model, state.data.replace(qpos=qpos))
+        observation = self.get_observation(data)
+        return state.replace(key=key, data=data, next_observation=observation, actual_next_observation=observation)
 
     @partial(jax.vmap, in_axes=(None, 0, None))
     @partial(jax.jit, static_argnums=(0,))
