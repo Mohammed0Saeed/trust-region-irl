@@ -77,8 +77,7 @@ COMMON_ARGS=(
   --environment.nr_envs="${NR_ENVS:-4096}"
 )
 
-# Options that only the trirl_ppo_spr trainer knows (the teammate's trirl_ppo_byol_s and trirl_ppo_fb reject them);
-# for R and B0 the data hash is checked by run.sh only.
+# Options of the trirl_ppo_spr trainer.
 SPR_ONLY_ARGS=(
   --algorithm.expected_data_sha256="${DATA_SHA256}"
   --algorithm.milestone_every_evals="${MILESTONE_EVERY:-12}"
@@ -112,16 +111,6 @@ set_method() {
 
 set_base_method() {
   case "$1" in
-    B0)  # old method: Boltzmann (DSM) encoder on pos_ort features
-      ALGO="trirl_ppo_fb.flax_full_jit"
-      METHOD_ARGS=(
-        --algorithm.reward_type=boltzmann-feature-based
-        --algorithm.boltzmann_hidden_dims=16,32,64
-        --algorithm.boltzmann_latent_dim=16
-        --algorithm.boltzmann_energy_hidden_dim=32
-        --algorithm.dsm_alpha=0.001
-        --algorithm.dsm_sigma=0.5
-      ) ;;
     B|S|SG|SC|BG)  # same code (trirl_ppo_spr), same encoder / budgets; they differ only in the flags below
       ALGO="trirl_ppo_spr.flax_full_jit"
       METHOD_ARGS=(--algorithm.pretrain_env_steps="${PRETRAIN_ENV_STEPS}" --algorithm.ssl_loss=cosine --algorithm.w_sigreg=0.0)
@@ -145,11 +134,8 @@ set_base_method() {
       ALGO="trirl_ppo_spr.flax_full_jit"
       METHOD_ARGS=(--algorithm.pretrain_env_steps="${PRETRAIN_ENV_STEPS}" --algorithm.ssl_loss=cosine --algorithm.w_sigreg=0.0
                    --algorithm.predictor_mode=byol_s --algorithm.gae_cut_on_truncation=False) ;;
-    R)   # teammate's original BYOL-S code (regression reference for B)
-      ALGO="trirl_ppo_byol_s.flax_full_jit"
-      METHOD_ARGS=(--algorithm.pretrain_env_steps="${PRETRAIN_ENV_STEPS}") ;;
     *)
-      echo "unknown METHOD '$1' (known: B BG S SG SC L N B_NOGAE R B0, optionally with _TH / _FRZ / _FN)" >&2
+      echo "unknown METHOD '$1' (known: B BG S SG SC L N B_NOGAE, optionally with _TH / _FRZ / _FN)" >&2
       return 1 ;;
   esac
   if [[ "${ALGO}" == trirl_ppo_spr.* ]]; then METHOD_ARGS+=("${SPR_ONLY_ARGS[@]}"); fi
@@ -172,8 +158,6 @@ base_method_desc() {
     L)      echo "LeJEPA-style latent prediction + SIGReg (K=5, no EMA/stop-grad), exploratory" ;;
     N)      echo "CPC-style bilinear InfoNCE (K=5, no EMA/stop-grad), exploratory" ;;
     B_NOGAE) echo "B without the GAE truncation fix (regression check)" ;;
-    R)      echo "teammate's original trirl_ppo_byol_s (regression reference)" ;;
-    B0)     echo "Boltzmann (DSM) encoder" ;;
     *)      echo "$1" ;;
   esac
 }

@@ -1,3 +1,6 @@
+> **This branch: PushT self-supervised reward encoders.** Commands to reproduce the runs are in
+> [experiments/pusht/README.md](experiments/pusht/README.md).
+
 <img align="right" src="figs/ICML-logo.svg" height="45" alt="ICML 2026">
 <span>
   <img src="figs/ias_logo_dark.svg" height="32" alt="Intelligent Autonomous Systems Group">&nbsp;&nbsp;
