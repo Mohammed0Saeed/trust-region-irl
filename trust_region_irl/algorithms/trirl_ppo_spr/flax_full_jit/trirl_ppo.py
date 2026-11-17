@@ -22,6 +22,7 @@ from trust_region_irl.algorithms.trirl_ppo_spr.flax_full_jit.general_properties 
 from trust_region_irl.algorithms.trirl_ppo_spr.flax_full_jit.policy import get_policy
 from trust_region_irl.algorithms.trirl_ppo_spr.flax_full_jit.critic import get_critic
 from trust_region_irl.algorithms.trirl_ppo_spr.flax_full_jit.discriminator import get_discriminator
+from trust_region_irl.algorithms.trirl_ppo_spr.flax_full_jit import fn_correction
 from trust_region_irl.algorithms.trirl_ppo_spr.flax_full_jit.data_utils import prepare_expert_data, expert_data_spec, verify_data_sha256
 from trust_region_irl.algorithms.trirl_ppo_spr.flax_full_jit.spr import init_target_from_online, ema_update_target, count_params
 from trust_region_irl.algorithms.trirl_ppo_spr.flax_full_jit import windows as win_utils
@@ -81,6 +82,7 @@ class TRIRL_PPO:
         self.nr_multi_learning_and_eval_save_iterations = self.total_timesteps // self.evaluation_and_save_frequency
         self.nr_updates_per_multi_learning_iteration = self.evaluation_and_save_frequency // self.batch_size
         self.os_shape = self.train_env.single_observation_space.shape
+        self.nr_trirl_iterations = self.nr_multi_learning_and_eval_save_iterations * self.nr_updates_per_multi_learning_iteration
         self.as_shape = self.train_env.single_action_space.shape
         self.horizon = self.train_env.horizon
         self.retraining = config.algorithm.retraining
@@ -108,6 +110,16 @@ class TRIRL_PPO:
         self.nr_pretrain_iterations = int(self.pretrain_env_steps // self.batch_size)  # one iteration = one rollout of nr_envs * nr_steps
         self.warmup_env_steps = config.algorithm.warmup_env_steps
         self.w_disc_loss = config.algorithm.w_disc_loss
+        # Reward correction (PLAN_phase2.md): "theta" mixes theta only and takes the newest encoder (Phase 1);
+        # "function" mixes the rewards of every past discriminator (official trirl_ppo, full history, fn_correction.py).
+        self.correction_mode = config.algorithm.correction_mode
+        if self.correction_mode not in ("theta", "function"):
+            raise ValueError(f"correction_mode must be 'theta' or 'function', got '{self.correction_mode}'")
+        self.log_correction_residual = config.algorithm.log_correction_residual
+        self.use_fn_buffer = self.correction_mode == "function" or self.log_correction_residual
+        self.fn_chunk_size = config.algorithm.fn_chunk_size
+        # FRZ: the encoder keeps its pre-trained value during TRIRL (no BCE, SSL or SIGReg update of it)
+        self.freeze_encoder_online = config.algorithm.freeze_encoder_online
         self.target_momentum = config.algorithm.target_momentum
 
         # SPR / SIGReg / InfoNCE
@@ -220,6 +232,13 @@ class TRIRL_PPO:
             )
         )
         self.corrected_reward_state = self.discriminator_state
+        if self.use_fn_buffer:
+            # every iteration of the run, no truncation; a restored model keeps the capacity it was saved with
+            capacity = int(config.algorithm.fn_buffer_capacity or 0) or int(-(-int(self.nr_trirl_iterations) // self.fn_chunk_size) * self.fn_chunk_size)
+            self.fn_buffer_capacity = capacity  # written to config_algorithm.json with every checkpoint (save)
+            self.fn_buffer = fn_correction.create(fn_correction.reward_params(discriminator_params), capacity)
+        else:
+            self.fn_buffer = {}
 
         # Encoder-only pre-training uses its own optimiser state and a constant learning rate,
         # so it does not advance the discriminator's learning-rate schedule
@@ -248,7 +267,7 @@ class TRIRL_PPO:
 
             # Expert demonstrations
             def _prepare_expert_data():
-                return prepare_expert_data(self.data_path)
+                return prepare_expert_data(self.data_path, orientation_repr=getattr(self.train_env, "orientation_repr", "quat"))
 
             demonstrations = jax.experimental.io_callback(_prepare_expert_data, expert_data_spec(num_samples=self.num_data_samples, state_dim=self.train_env.single_observation_space.shape[0], action_dim=self.train_env.single_action_space.shape[0]))
             expert_states = demonstrations["states"]
@@ -262,6 +281,7 @@ class TRIRL_PPO:
             critic_state = self.critic_state
             discriminator_state = self.discriminator_state
             corrected_reward_state = self.corrected_reward_state
+            fn_buffer = self.fn_buffer
 
             """ SSL Pre-training """
             # Encoder-only pre-training before TRIRL: rollouts with the initial policy (never updated) plus expert
@@ -364,12 +384,12 @@ class TRIRL_PPO:
                                        policy_state, critic_state, discriminator_state, corrected_reward_state)
 
             def multi_learning_and_eval_save_iteration(multi_learning_and_eval_save_iteration_carry, multi_learning_iteration_step):
-                policy_state, critic_state, discriminator_state, corrected_reward_state, \
+                policy_state, critic_state, discriminator_state, corrected_reward_state, fn_buffer, \
                 (expert_states, expert_actions, expert_next_states, expert_absorbing, expert_features), \
                 env_state, key = multi_learning_and_eval_save_iteration_carry
 
                 def learning_iteration(learning_iteration_carry, learning_iteration_step):
-                    policy_state, critic_state, discriminator_state, corrected_reward_state, \
+                    policy_state, critic_state, discriminator_state, corrected_reward_state, fn_buffer, \
                     (expert_states, expert_actions, expert_next_states, expert_absorbing, expert_features), \
                     env_state, key = learning_iteration_carry
 
@@ -459,6 +479,8 @@ class TRIRL_PPO:
                     combined_learning_iteration_step = (multi_learning_iteration_step * self.nr_updates_per_multi_learning_iteration) + learning_iteration_step + 1
                     global_step = combined_learning_iteration_step * self.nr_steps * self.nr_envs
                     encoder_switch = jnp.where(global_step < self.warmup_env_steps, 0.0, 1.0)
+                    if self.freeze_encoder_online:
+                        encoder_switch = jnp.asarray(0.0)  # FRZ: the BCE / gradient penalty never trains the encoder
 
                     vmap_bce_gp_fn = jax.vmap(bce_gp_fn, in_axes=(None, 0, 0, 0, 0, 0, 0, None), out_axes=0)
 
@@ -474,6 +496,9 @@ class TRIRL_PPO:
                             expert_labels[minibatch_indices],
                             encoder_switch,
                         ))
+                        if self.freeze_encoder_online:  # FRZ: only theta is learned (SSL / SIGReg would only move the frozen encoder)
+                            total_loss = self.w_disc_loss * bce_loss
+                            return total_loss, {**bce_metrics, "loss/total_loss": total_loss, "loss/encoder_switch": encoder_switch}
                         window_batch = make_window_batch(minibatch_indices, agent_flat, expert_idx[minibatch_indices])
                         ssl, sigreg_loss, ssl_metrics = compute_ssl(self.discriminator, discriminator_params, window_batch, sigreg_key, **ssl_kwargs)
 
@@ -499,7 +524,11 @@ class TRIRL_PPO:
                         (trirl_loss, (metrics)), (discriminator_gradients) = grad_trirl_loss_fn(
                             discriminator_state.params, minibatch_indices_disc, encoder_switch, sigreg_key)
 
+                        frozen_encoder = discriminator_state.params["params"]["online_encoder"]
                         discriminator_state = discriminator_state.apply_gradients(grads=discriminator_gradients)
+                        if self.freeze_encoder_online:  # also against optimiser momentum: the encoder stays bit-identical
+                            restored = {**discriminator_state.params, "params": {**discriminator_state.params["params"], "online_encoder": frozen_encoder}}
+                            discriminator_state = discriminator_state.replace(params=restored)
 
                         # EMA update of the target encoder and projector (copy the result to the discriminator state)
                         discriminator_state = discriminator_state.replace(params=ema_update_target(discriminator_state.params, self.target_momentum))
@@ -534,6 +563,35 @@ class TRIRL_PPO:
                             + self.epsilon * self.beta * _get_log_density_ratio(_inputs_absorbing, discriminator_state).reshape(rewards.shape))
                     else:
                         corr_reward_absorbing_state = jnp.asarray(0.0)
+
+                    correction_metrics = {}
+                    if self.use_fn_buffer:
+                        # FN: append D_t, then the reward is the recursion over every discriminator so far (fn_correction.py)
+                        fn_buffer = fn_correction.add(fn_buffer, fn_correction.reward_params(discriminator_state.params))
+                        template = discriminator_state.params
+
+                        def apply_reward(rp, x):
+                            return self.discriminator.apply({**template, "params": {**template["params"], **rp}}, x, method=self.discriminator._reward)
+
+                        def fn_reward(x):
+                            r = fn_correction.mixture_reward(apply_reward, fn_buffer, x.reshape((-1,) + self.os_shape),
+                                                             self.epsilon, self.beta, self.fn_chunk_size)
+                            return self.entropy_coef * r.reshape(rewards.shape)
+
+                        fn_corr_reward = fn_reward(states)
+                        fn_corr_reward_absorbing_state = fn_reward(next_states) if self.handle_absorbing_states else jnp.asarray(0.0)
+                        # per-iteration difference between the two corrections on this batch (A2 follow-up)
+                        used = fn_corr_reward if self.correction_mode == "function" else corr_reward
+                        diff = fn_corr_reward - corr_reward
+                        correction_metrics = {
+                            "correction/fn_buffer_level": fn_buffer["level"].astype(jnp.float32),
+                            "correction/fn_minus_theta_std_rel": jnp.std(diff) / (jnp.std(used) + 1e-12),
+                            "correction/fn_minus_theta_mean": jnp.mean(diff),
+                            "correction/fn_theta_corr": jnp.corrcoef(fn_corr_reward.reshape(-1), corr_reward.reshape(-1))[0, 1],
+                            "correction/reward_std": jnp.std(used),
+                        }
+                        if self.correction_mode == "function":
+                            corr_reward, corr_reward_absorbing_state = fn_corr_reward, fn_corr_reward_absorbing_state
 
                     corr_reward = self.env_reward_frac * rewards + (1 - self.env_reward_frac) * corr_reward
                     corr_reward_absorbing_state = (1 - self.env_reward_frac) * corr_reward_absorbing_state # the environment pays no reward in the absorbing state
@@ -689,6 +747,8 @@ class TRIRL_PPO:
                     ppo_optimization_metrics["v_value/explained_variance"] = 1 - jnp.var(returns - values) / (jnp.var(returns) + 1e-8)
                     ppo_optimization_metrics["policy/std_dev"] = jnp.mean(jnp.exp(policy_state.params["params"]["policy_logstd"]))
                     ppo_optimization_metrics["correction/eta"] = eta
+                    if self.use_fn_buffer:
+                        fn_buffer = fn_correction.set_last_eta(fn_buffer, eta)  # eta of this iteration's PPO update
 
 
                     """ Reward Correction """
@@ -708,7 +768,7 @@ class TRIRL_PPO:
                     corrected_reward_state = discriminator_state.replace(params=new_params)
 
                     # Logging
-                    combined_metrics = {**infos, **disc_optimization_metrics, **ppo_optimization_metrics}
+                    combined_metrics = {**infos, **disc_optimization_metrics, **ppo_optimization_metrics, **correction_metrics}
                     combined_metrics = tree.map_structure(lambda x: jnp.mean(x), combined_metrics)
 
                     def callback(carry):
@@ -728,14 +788,14 @@ class TRIRL_PPO:
                     combined_learning_iteration_step = (multi_learning_iteration_step * self.nr_updates_per_multi_learning_iteration) + learning_iteration_step + 1
                     jax.debug.callback(callback, (combined_metrics, learning_iteration_step, combined_learning_iteration_step, parallel_seed_id))
 
-                    return (policy_state, critic_state, discriminator_state, corrected_reward_state, (expert_states, expert_actions, expert_next_states, expert_absorbing, expert_features), env_state, key), corrected_reward_state.params['params']['theta']  # the reward theta the policy uses (retraining / curriculum)
+                    return (policy_state, critic_state, discriminator_state, corrected_reward_state, fn_buffer, (expert_states, expert_actions, expert_next_states, expert_absorbing, expert_features), env_state, key), corrected_reward_state.params['params']['theta']  # the reward theta the policy uses (retraining / curriculum)
 
                 key, subkey = jax.random.split(key)
-                learning_iteration_carry, inner_thetas = jax.lax.scan(learning_iteration, (policy_state, critic_state, discriminator_state, corrected_reward_state,
+                learning_iteration_carry, inner_thetas = jax.lax.scan(learning_iteration, (policy_state, critic_state, discriminator_state, corrected_reward_state, fn_buffer,
                                                                                 (expert_states, expert_actions, expert_next_states, expert_absorbing, expert_features),
                                                                                 env_state, subkey), jnp.arange(self.nr_updates_per_multi_learning_iteration))
 
-                policy_state, critic_state, discriminator_state, corrected_reward_state, \
+                policy_state, critic_state, discriminator_state, corrected_reward_state, fn_buffer, \
                 (expert_states, expert_actions, expert_next_states, expert_absorbing, expert_features), \
                 env_state, key = learning_iteration_carry
 
@@ -830,10 +890,10 @@ class TRIRL_PPO:
                     #             rlx_logger.info(f"[save-best] new best eval/task_err={te:.4f} -> {self.best_model_file_name}")
                     # jax.debug.callback(save_with_check, policy_state, critic_state, discriminator_state, corrected_reward_state, eval_task_err_for_save)
 
-                    def save_with_check(policy_state, critic_state, discriminator_state, corrected_reward_state,
+                    def save_with_check(policy_state, critic_state, discriminator_state, corrected_reward_state, fn_buffer,
                                         eval_return, evaluation_index):
                         self.save(policy_state, critic_state, discriminator_state,
-                                  corrected_reward_state)  # latest.model
+                                  corrected_reward_state, fn_buffer=fn_buffer)  # latest.model
 
                         # milestones for the phase-2 freeze / probe experiments: every N evaluations and the last one
                         evaluation_index = int(np.asarray(evaluation_index).reshape(-1)[0])
@@ -842,7 +902,7 @@ class TRIRL_PPO:
                                 or evaluation_index == self.nr_multi_learning_and_eval_save_iterations):
                             milestone_name = f"milestone_eval{evaluation_index:03d}.model"
                             self.save(policy_state, critic_state, discriminator_state, corrected_reward_state,
-                                      file_name=milestone_name)
+                                      file_name=milestone_name, fn_buffer=fn_buffer)
                             rlx_logger.info(f"[save-milestone] evaluation {evaluation_index} -> {milestone_name}")
 
                         if self.evaluation_active:
@@ -852,18 +912,18 @@ class TRIRL_PPO:
                             if current_return > self.best_eval_return:
                                 self.best_eval_return = current_return
                                 self.save(policy_state, critic_state, discriminator_state, corrected_reward_state,
-                                          file_name=self.best_model_file_name)
+                                          file_name=self.best_model_file_name, fn_buffer=fn_buffer)
                                 rlx_logger.info(
                                     f"[save-best] new best eval/episode_return={current_return:.4f} -> {self.best_model_file_name}")
 
                     jax.debug.callback(save_with_check, policy_state, critic_state, discriminator_state,
-                                       corrected_reward_state, eval_return_for_save, multi_learning_iteration_step + 1)
+                                       corrected_reward_state, fn_buffer, eval_return_for_save, multi_learning_iteration_step + 1)
                     jax.debug.callback(self.save_thetas, inner_thetas, multi_learning_iteration_step)
 
-                return (policy_state, critic_state, discriminator_state, corrected_reward_state, (expert_states, expert_actions, expert_next_states, expert_absorbing, expert_features), env_state, key), inner_thetas
+                return (policy_state, critic_state, discriminator_state, corrected_reward_state, fn_buffer, (expert_states, expert_actions, expert_next_states, expert_absorbing, expert_features), env_state, key), inner_thetas
 
 
-            _, all_thetas =  jax.lax.scan(multi_learning_and_eval_save_iteration, (policy_state, critic_state, discriminator_state, corrected_reward_state,
+            _, all_thetas =  jax.lax.scan(multi_learning_and_eval_save_iteration, (policy_state, critic_state, discriminator_state, corrected_reward_state, fn_buffer,
                                                                   (expert_states, expert_actions, expert_next_states, expert_absorbing, expert_features),
                                                                   env_state, key), jnp.arange(self.nr_multi_learning_and_eval_save_iterations))
 
@@ -933,7 +993,7 @@ class TRIRL_PPO:
         os.makedirs(self.save_path, exist_ok=True)
         np.save(os.path.join(self.save_path, "theta_matrix.npy"), thetas)
 
-    def save(self, policy_state, critic_state, discriminator_state, corrected_reward_state, file_name=None):
+    def save(self, policy_state, critic_state, discriminator_state, corrected_reward_state, file_name=None, fn_buffer=None):
         file_name = file_name or self.latest_model_file_name
         checkpoint = {
             "policy": policy_state,
@@ -941,10 +1001,16 @@ class TRIRL_PPO:
             "discriminator": discriminator_state,
             "corrected_reward": corrected_reward_state,
         }
+        if fn_buffer:  # FN: every discriminator's reward parameters and its eta (the full corrected reward)
+            checkpoint["fn_buffer"] = fn_buffer
         save_args = orbax_utils.save_args_from_target(checkpoint)
+        if os.path.exists(f"{self.save_path}/tmp"):  # left over by an interrupted save
+            shutil.rmtree(f"{self.save_path}/tmp")
         self.latest_model_checkpointer.save(f"{self.save_path}/tmp", checkpoint, save_args=save_args)
         with open(f"{self.save_path}/tmp/config_algorithm.json", "w") as f:
-            json.dump(self.config.algorithm.to_dict(), f)
+            algorithm_config = self.config.algorithm.to_dict()
+            algorithm_config["fn_buffer_capacity"] = int(getattr(self, "fn_buffer_capacity", 0))  # restore builds the same buffer
+            json.dump(algorithm_config, f)
         with open(f"{self.save_path}/tmp/config_environment.json", "w") as f:
             json.dump(self.config.environment.to_dict(), f)
         shutil.make_archive(f"{self.save_path}/{file_name}", "zip", f"{self.save_path}/tmp")
@@ -960,7 +1026,8 @@ class TRIRL_PPO:
             rlx_logger.warning("Checkpoint has no config_environment.json (saved by an older version): cannot check the environment settings.")
             return
         saved = json.load(open(path, "r"))
-        for key in ("name", "feature_fn", "random_TPos", "horizon", "success_threshold", "eval_init_noise_xy", "eval_init_noise_yaw"):
+        for key in ("name", "feature_fn", "random_TPos", "horizon", "success_threshold", "eval_init_noise_xy", "eval_init_noise_yaw",
+                    "preset_set", "orientation_repr", "control_freq"):
             if key in saved and key in self.config.environment and saved[key] != self.config.environment[key]:
                 rlx_logger.warning(f"environment.{key} is {self.config.environment[key]} but the checkpoint was trained with {saved[key]}")
 
@@ -968,10 +1035,11 @@ class TRIRL_PPO:
         splitted_path = config.runner.load_model.split("/")
         checkpoint_dir = os.path.abspath("/".join(splitted_path[:-1]))
         checkpoint_file_name = splitted_path[-1]
-        if os.path.exists(f"{checkpoint_dir}/tmp"):
-            shutil.rmtree(f"{checkpoint_dir}/tmp")
-        shutil.unpack_archive(f"{checkpoint_dir}/{checkpoint_file_name}", f"{checkpoint_dir}/tmp", "zip")
-        checkpoint_dir = f"{checkpoint_dir}/tmp"
+        restore_dir = f"{checkpoint_dir}/restore_tmp"  # not models/tmp, which save() uses
+        if os.path.exists(restore_dir):
+            shutil.rmtree(restore_dir)
+        shutil.unpack_archive(f"{checkpoint_dir}/{checkpoint_file_name}", restore_dir, "zip")
+        checkpoint_dir = restore_dir
 
         loaded_algorithm_config = json.load(open(f"{checkpoint_dir}/config_algorithm.json", "r"))
         for key, value in loaded_algorithm_config.items():
@@ -987,14 +1055,20 @@ class TRIRL_PPO:
             "discriminator": model.discriminator_state,
             "corrected_reward": model.corrected_reward_state,
         }
-        restore_args = orbax_utils.restore_args_from_target(target)
         checkpointer = orbax.checkpoint.PyTreeCheckpointer()
+        saved_tree = checkpointer.metadata(checkpoint_dir)
+        saved_tree = getattr(getattr(saved_tree, "item_metadata", saved_tree), "tree", saved_tree)
+        if model.fn_buffer and "fn_buffer" in saved_tree:  # FN / residual runs; pretrain_end has no buffer yet
+            target["fn_buffer"] = model.fn_buffer
+        restore_args = orbax_utils.restore_args_from_target(target)
         checkpoint = checkpointer.restore(checkpoint_dir, item=target, restore_args=restore_args)
 
         model.policy_state = checkpoint["policy"]
         model.critic_state = checkpoint["critic"]
         model.discriminator_state = checkpoint["discriminator"]
         model.corrected_reward_state = checkpoint["corrected_reward"]
+        if "fn_buffer" in checkpoint:
+            model.fn_buffer = checkpoint["fn_buffer"]
 
         shutil.rmtree(checkpoint_dir)
 

@@ -9,6 +9,9 @@ so a learned policy's observations/actions match the expert distribution:
     moves in the horizontal plane (planar, fixed-height) -- matching the data.
   * 24-dim observation: block_pos_rel_goal(3) + block_quat_rel_goal(4)
     + ee_pos_rel_goal(3) + arm_qpos(7) + arm_qvel(7).
+    With orientation_repr="rot6d" the quaternion is replaced by the first two
+    columns of the block rotation matrix (6, continuous and invariant to the
+    quaternion sign q ~ -q) -> 26-dim observation. Default "quat" (Phase 1).
 
 Control runs at 20 Hz; the model timestep is 0.025 s -> 2 sim substeps per
 control step, and the IK is recomputed each substep (as in the generator).
@@ -75,6 +78,52 @@ def _quat_error_body(qd, q):
     return _quat_to_rotvec(jnp.where(qe[0] < 0.0, -qe, qe))
 
 
+ORIENTATION_REPRS = ("quat", "rot6d")
+
+
+def obs_layout(orientation_repr):
+    """Slices of the observation for an orientation representation ("quat": 24 dims, "rot6d": 26 dims)."""
+    if orientation_repr not in ORIENTATION_REPRS:
+        raise ValueError(f"orientation_repr must be one of {ORIENTATION_REPRS}, got '{orientation_repr}'")
+    k = 4 if orientation_repr == "quat" else 6
+    return dict(block_pos=slice(0, 3), orient=slice(3, 3 + k), ee=slice(3 + k, 6 + k),
+                arm_q=slice(6 + k, 13 + k), arm_v=slice(13 + k, 20 + k), dim=20 + k)
+
+
+def quat_to_rot6d(q):
+    """(..., 4) wxyz -> (..., 6) first two columns of the rotation matrix [R00 R10 R20 R01 R11 R21].
+    Quadratic in q, so q and -q give the same value; continuous everywhere."""
+    q = q / jnp.linalg.norm(q, axis=-1, keepdims=True)
+    w, x, y, z = q[..., 0], q[..., 1], q[..., 2], q[..., 3]
+    return jnp.stack([1 - 2 * (y * y + z * z), 2 * (x * y + w * z), 2 * (x * z - w * y),
+                      2 * (x * y - w * z), 1 - 2 * (x * x + z * z), 2 * (y * z + w * x)], axis=-1)
+
+
+def quat_obs_to(observations, orientation_repr):
+    """Convert 24-dim (quaternion) observations, e.g. the expert dataset, to the given representation."""
+    if orientation_repr == "quat":
+        return observations
+    obs = jnp.asarray(observations)
+    return jnp.concatenate([obs[..., 0:3], quat_to_rot6d(obs[..., 3:7]), obs[..., 7:]], axis=-1)
+
+
+def orientation_sin2_half(observations):
+    """sin^2(theta/2) of the block rotation relative to the goal (0 aligned, 1 at 180 deg), dispatched on the
+    observation size. The 24-dim (quaternion) branch is the original Phase-1 expression 1 - w^2."""
+    if observations.shape[-1] == 24:
+        w = observations[..., 3]
+        return 1.0 - jnp.clip(w * w, 0.0, 1.0)
+    if observations.shape[-1] == 26:
+        r = observations[..., 3:9]
+        r22 = r[..., 0] * r[..., 4] - r[..., 1] * r[..., 3]  # z of column1 x column2
+        cos_theta = 0.5 * (r[..., 0] + r[..., 4] + r22 - 1.0)
+        return jnp.clip(0.5 * (1.0 - cos_theta), 0.0, 1.0)
+    raise ValueError(f"unexpected observation size {observations.shape[-1]}")
+
+
+CONTROL_FREQ = 20  # Hz, Phase-1 default (see PushT.__init__ control_freq)
+
+
 class PushT:
     # pre-calculated block poses and orientation that are randomly generated while not spawning in the same location as for the end-effector
     preset_block_poses = jnp.array([[0.60, -0.10,  jnp.pi / 2],
@@ -112,8 +161,10 @@ class PushT:
 
     def __init__(self, render, horizon=250, reward_style="dense",
                  success_threshold=0.1, feature_fn="base", random_TPos = False,
-                 eval_init_noise_xy=0.0, eval_init_noise_yaw=0.0, preset_set="legacy"):
+                 eval_init_noise_xy=0.0, eval_init_noise_yaw=0.0, preset_set="legacy", orientation_repr="quat", control_freq=CONTROL_FREQ):
         self.random_TPos = random_TPos
+        self.orientation_repr = orientation_repr
+        self.obs_layout = obs_layout(orientation_repr)
         if preset_set not in ("legacy", "paper"):
             raise ValueError(f"preset_set must be 'legacy' or 'paper', got '{preset_set}'")
         self.preset_set = preset_set
@@ -137,8 +188,11 @@ class PushT:
         self.mjx_data = mjx.make_data(self.mjx_model)
 
         # 20 Hz control; model timestep 0.025 s -> 2 sim steps per control step
+        # control_freq=20 (Phase 1, default): 2 physics steps of 0.025 s per action; 40 (v3): 1 step per action, the
+        # timebase of the expert data (one recorded transition = one 0.025 s physics step, see RESULTS_phase2 A5)
+        self.control_freq = control_freq
         self.nr_intermediate_steps = max(
-            round((1.0 / self.CONTROL_FREQ) / self.mj_model.opt.timestep), 1)
+            round((1.0 / control_freq) / self.mj_model.opt.timestep), 1)
 
         # indices
         self.ee_body_id = self.mj_model.body("ee_frame").id
@@ -172,12 +226,12 @@ class PushT:
         self.initial_qpos = jnp.array(self._compute_initial_qpos(), dtype=jnp.float32)
         self.initial_qvel = jnp.zeros(self.mjx_model.nv, dtype=jnp.float32)
 
-        # 2-D normalised action, 24-dim observation
+        # 2-D normalised action, 24-dim (quat) or 26-dim (rot6d) observation
         self.single_action_space = BoxSpace(
             low=jnp.array([-1.0, -1.0]), high=jnp.array([1.0, 1.0]),
             shape=(2,), dtype=jnp.float32)
         self.single_observation_space = BoxSpace(
-            low=-jnp.inf, high=jnp.inf, shape=(24,), dtype=jnp.float32)
+            low=-jnp.inf, high=jnp.inf, shape=(self.obs_layout["dim"],), dtype=jnp.float32)
         if self.feature_fn == "state_action":
             feature_dim = self.single_observation_space.shape[0] + self.single_action_space.shape[0]
         elif self.feature_fn == "base":
@@ -470,7 +524,8 @@ class PushT:
         ee_rel = data.xpos[self.ee_body_id] - self.goal_pos
         arm_q = data.qpos[self.arm_qadr]
         arm_v = data.qvel[self.arm_dofadr]
-        obs = jnp.concatenate([block_pos, block_quat, ee_rel, arm_q, arm_v])
+        orient = block_quat if self.orientation_repr == "quat" else quat_to_rot6d(block_quat)
+        obs = jnp.concatenate([block_pos, orient, ee_rel, arm_q, arm_v])
         # nan_to_num + clip: a diverged env stays bounded so it can't poison the
         # discriminator/critic (expert obs are all < ~3, so clipping never alters them).
         obs = jnp.nan_to_num(obs, nan=0.0, posinf=self.OBS_CLIP, neginf=-self.OBS_CLIP)
@@ -544,10 +599,9 @@ class PushT:
             # the goal -> high for the expert (which arrives) and ~0 for a policy
             # parked partway, AND steep near the goal (a real finishing gradient).
             block_pos = observation[:, 0:3]
-            w = observation[:, 3]
-            ee_rel = observation[:, 7:10]
+            ee_rel = observation[:, self.obs_layout["ee"]]
             pos_err = jnp.linalg.norm(block_pos, axis=-1)
-            orient_err = 1.0 - jnp.clip(w * w, 0.0, 1.0)          # sin^2(theta/2): 0 aligned, 0.5 at 90deg, 1 at 180deg
+            orient_err = orientation_sin2_half(observation)       # sin^2(theta/2): 0 aligned, 0.5 at 90deg, 1 at 180deg
             ee_block = jnp.linalg.norm(ee_rel - block_pos, axis=-1)
             pos_bump_tight = jnp.exp(-(pos_err / 0.04) ** 2)      # ~1 only when essentially placed
             pos_bump_wide = jnp.exp(-(pos_err / 0.12) ** 2)
@@ -560,10 +614,9 @@ class PushT:
 
         elif self.feature_fn == "base_without_ctrl":
             block_pos = observation[:, 0:3]            # block pos rel goal
-            w = observation[:, 3]                      # block quat w (rel goal)
-            ee_rel = observation[:, 7:10]              # ee pos rel goal
+            ee_rel = observation[:, self.obs_layout["ee"]]  # ee pos rel goal
             pos_err = jnp.linalg.norm(block_pos, axis=-1)
-            orient_err = 1.0 - jnp.clip(w * w, 0.0, 1.0)        # sin^2(theta/2); 0 = aligned
+            orient_err = orientation_sin2_half(observation)     # sin^2(theta/2); 0 = aligned
             ee_block = jnp.linalg.norm(ee_rel - block_pos, axis=-1)  # ee-to-block dist (contact)
             features = jnp.stack([-pos_err, -orient_err, -ee_block], axis=-1)
 
@@ -572,19 +625,17 @@ class PushT:
             # can express the task (a linear reward over raw block coords cannot).
             # All are negative "rewards" (higher = better), mirroring point_maze.
             block_pos = observation[:, 0:3]            # block pos rel goal
-            w = observation[:, 3]                      # block quat w (rel goal)
-            ee_rel = observation[:, 7:10]              # ee pos rel goal
+            ee_rel = observation[:, self.obs_layout["ee"]]  # ee pos rel goal
             pos_err = jnp.linalg.norm(block_pos, axis=-1)
-            orient_err = 1.0 - jnp.clip(w * w, 0.0, 1.0)        # sin^2(theta/2); 0 = aligned
+            orient_err = orientation_sin2_half(observation)     # sin^2(theta/2); 0 = aligned
             ee_block = jnp.linalg.norm(ee_rel - block_pos, axis=-1)  # ee-to-block dist (contact)
             ctrl = jnp.sum(jnp.square(action), axis=-1)
             features = jnp.stack([-pos_err, -orient_err, -ee_block, -ctrl], axis=-1)
 
         elif self.feature_fn == "pos_ort":
             block_pos = observation[:, 0:3]  # block pos rel goal
-            w = observation[:, 3]  # block quat w (rel goal)
             pos_err = jnp.linalg.norm(block_pos, axis=-1).reshape(-1, 1)
-            orient_err = (1.0 - jnp.clip(w * w, 0.0, 1.0)).reshape(-1, 1)  # sin^2(theta/2); 0 = aligned
+            orient_err = orientation_sin2_half(observation).reshape(-1, 1)  # sin^2(theta/2); 0 = aligned
             features = jnp.concatenate([-pos_err, -orient_err], axis=-1)
         else:
             features = observation

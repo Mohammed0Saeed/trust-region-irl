@@ -17,7 +17,9 @@ def verify_data_sha256(data_path, expected=""):
     return actual
 
 
-def prepare_expert_data(data_path, cutoff=1):
+def prepare_expert_data(data_path, cutoff=1, orientation_repr="quat"):
+    """orientation_repr: the env's observation format; the stored (24-dim quaternion) states are converted to it."""
+    from trust_region_irl.environments.pusht_mjx.environment import quat_obs_to
     dataset = dict()
     expert_files = np.load(data_path)
 
@@ -39,6 +41,9 @@ def prepare_expert_data(data_path, cutoff=1):
     dataset["actions"] = actions[:cutoff]
     dataset["next_states"] = _flatten_feature_array(expert_files["next_states"])[:cutoff]
     dataset["absorbing"] = _flatten_scalar_array(expert_files["absorbing"])[:cutoff]
+    if orientation_repr != "quat":
+        dataset["states"] = np.asarray(quat_obs_to(dataset["states"], orientation_repr), dtype=np.float32)
+        dataset["next_states"] = np.asarray(quat_obs_to(dataset["next_states"], orientation_repr), dtype=np.float32)
 
     return dataset
 

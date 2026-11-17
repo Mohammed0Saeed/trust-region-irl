@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Run one (METHOD, SEED) of the PushT comparison. Used locally and by cluster/pusht.sbatch.
-#   PROTOCOL=paper (default) | fixed selects data, start set and wandb group (see methods.sh); DRY_RUN=1 prints the command line only.
+#   PROTOCOL=paper (default) | fixed | v3 selects data, start set and wandb group (see methods.sh); DRY_RUN=1 prints the command line only.
 #   METHOD=S SEED=0 experiments/pusht/run.sh [extra --flags]                 # full run (wandb, saves models)
 #   SMOKE=1 METHOD=S SEED=0 PYTHON=/path/to/python experiments/pusht/run.sh   # tiny sizes, no wandb, no saving
 #   SMOKE_SAVE=1 ...                                                          # tiny sizes, no wandb, WITH saving (checks save/restore)
@@ -12,7 +12,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 METHOD="${METHOD:?set METHOD}"
-export PROTOCOL="${PROTOCOL:-paper}"    # paper | fixed, defined in methods.sh
+export PROTOCOL="${PROTOCOL:-paper}"    # paper | fixed | v3, defined in methods.sh
 SEED="${SEED:?set SEED}"
 RUNNER_MODE="${RUNNER_MODE:-train}"
 UNIQUE="${SLURM_JOB_ID:-$(date +%m%d_%H%M%S)}"
@@ -35,7 +35,6 @@ elif [[ "${SMOKE:-0}" == "1" || "${SMOKE_SAVE:-0}" == "1" ]]; then
 else
   # wandb naming: group = exp_name, name = {METHOD}_s{SEED}_{job id}, tags = pusht,phase1,method:X,seed:N
   GIT_COMMIT="$(cat "${REPO_ROOT}/GIT_COMMIT" 2>/dev/null || echo unknown)"
-  export WANDB_TAGS="pusht,${PHASE:-phase1},method:${METHOD},seed:${SEED},protocol:${PROTOCOL}"
   RUNNER_ARGS=(
     --runner.track_wandb=True --runner.track_tb=False --runner.save_model=True --runner.track_console=True
     --runner.wandb_entity="${WANDB_ENTITY:-yichen-feng-tu-darmstadt}"
@@ -47,6 +46,7 @@ fi
 
 source "${REPO_ROOT}/experiments/pusht/methods.sh"
 set_method "${METHOD}"
+export WANDB_TAGS="pusht,${PHASE:-${PHASE_DEFAULT}},method:${METHOD},seed:${SEED},protocol:${PROTOCOL}"
 RUNNER_ARGS=("${RUNNER_ARGS[@]//placeholder_desc/$(method_desc "${METHOD}")}")
 if [[ "${RUNNER_MODE}" != "test" ]]; then
   RUNNER_ARGS+=(--runner.exp_name="${EXP_NAME:-${DEFAULT_EXP_NAME}}")   # wandb group

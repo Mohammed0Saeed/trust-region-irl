@@ -19,9 +19,15 @@ PER_START_METRICS = ("is_success", "geometric_success_rate", "reached_0.1_rate",
 
 
 def goal_errors(observations):
-    """Block position / orientation error w.r.t. the goal, from (..., 24) observations."""
+    """Block position / orientation error w.r.t. the goal, from (..., 24) quaternion or (..., 26) rot6d
+    observations. The quaternion branch is the original Phase-1 expression."""
     position_error = jnp.linalg.norm(observations[..., :3], axis=-1)
-    orientation_error = 2.0 * jnp.arccos(jnp.clip(jnp.abs(observations[..., 3]), 0.0, 1.0))
+    if observations.shape[-1] == 24:
+        orientation_error = 2.0 * jnp.arccos(jnp.clip(jnp.abs(observations[..., 3]), 0.0, 1.0))
+    else:
+        from trust_region_irl.environments.pusht_mjx.environment import orientation_sin2_half
+        # theta = 2 asin(sqrt(sin^2(theta/2))), well conditioned near 0 (unlike arccos of the trace)
+        orientation_error = 2.0 * jnp.arcsin(jnp.sqrt(orientation_sin2_half(observations)))
     return position_error, orientation_error
 
 

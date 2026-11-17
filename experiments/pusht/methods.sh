@@ -7,14 +7,25 @@
 # PROTOCOL=paper (default): 600 paper demonstrations (Table-1 starts x 100), training starts drawn from the six Table-1
 #                           starts, evaluation per start (see PLAN_phase1.md section 3).
 # PROTOCOL=fixed:           old protocol, 93 demonstrations of one fixed start (kept for reference only).
+# PROTOCOL=v3:              Phase-2 base (PLAN_phase2.md): paper data and starts, 40 Hz control (1 physics step per
+#                           action, the timebase of the expert data), rot6d orientation, horizon 500 (12.5 s),
+#                           gamma and GAE lambda as square roots of 0.99 / 0.95 (same decay per physical second).
 PROTOCOL="${PROTOCOL:-paper}"
+# Phase-1 timebase / observation defaults; PROTOCOL=v3 overrides them
+CONTROL_FREQ_DEFAULT=20; HORIZON_DEFAULT=250; GAMMA_DEFAULT=0.99; GAE_LAMBDA_DEFAULT=0.95; ORIENT_REPR_DEFAULT=quat
+LOG_RESIDUAL_DEFAULT=False; PHASE_DEFAULT=phase1
 case "${PROTOCOL}" in
-  paper)
+  paper|v3)
     DEFAULT_PUSHT_DATA="${REPO_ROOT}/trirl_dataset/rl_expert/trirl_expert_data_100_episodes.npz"
     DATA_SHA256="d1374c0b605dbf22f2901e9846133a5864f850677770a4a90f8575ffdcf8fc9b"
     RANDOM_TPOS=True
     PRESET_SET=paper
-    DEFAULT_EXP_NAME=pusht_phase1_paper ;;
+    DEFAULT_EXP_NAME=pusht_phase1_paper
+    if [[ "${PROTOCOL}" == v3 ]]; then
+      CONTROL_FREQ_DEFAULT=40; HORIZON_DEFAULT=500; GAMMA_DEFAULT=0.994987; GAE_LAMBDA_DEFAULT=0.974679; ORIENT_REPR_DEFAULT=rot6d
+      LOG_RESIDUAL_DEFAULT=True; PHASE_DEFAULT=phase2
+      DEFAULT_EXP_NAME=pusht_phase2
+    fi ;;
   fixed)
     DEFAULT_PUSHT_DATA="${REPO_ROOT}/trirl_dataset/rl_expert/expert_dataset_pusht_mtp_clean_93_episodes_trirl_f32abs.npz"
     DATA_SHA256=""
@@ -22,7 +33,7 @@ case "${PROTOCOL}" in
     PRESET_SET=legacy
     DEFAULT_EXP_NAME=pusht_phase1 ;;
   *)
-    echo "unknown PROTOCOL '${PROTOCOL}' (known: paper fixed)" >&2
+    echo "unknown PROTOCOL '${PROTOCOL}' (known: paper fixed v3)" >&2
     return 1 2>/dev/null || exit 1 ;;
 esac
 PUSHT_DATA="${PUSHT_DATA:-${DEFAULT_PUSHT_DATA}}"
@@ -48,18 +59,21 @@ COMMON_ARGS=(
   --algorithm.epsilon=0.2
   --algorithm.init_eta=30.0
   --algorithm.gp_lambda=0.5
-  --algorithm.gae_lambda=0.95
+  --algorithm.gamma="${GAMMA:-${GAMMA_DEFAULT}}"
+  --algorithm.gae_lambda="${GAE_LAMBDA:-${GAE_LAMBDA_DEFAULT}}"
   --algorithm.std_dev=0.4
   --algorithm.anneal_learning_rate=True
   --algorithm.evaluation_and_save_frequency="${EVAL_FREQUENCY:-2097152}"
   --environment.name=pusht_mjx
   --environment.random_TPos="${RANDOM_TPOS}"
   --environment.preset_set="${PRESET_SET}"
-  --environment.horizon=250
+  --environment.horizon="${HORIZON:-${HORIZON_DEFAULT}}"
+  --environment.control_freq="${CONTROL_FREQ:-${CONTROL_FREQ_DEFAULT}}"
   --environment.success_threshold=0.05
   --environment.eval_init_noise_xy=0.01
   --environment.eval_init_noise_yaw=0.0872665
   --environment.feature_fn=pos_ort
+  --environment.orientation_repr="${ORIENT_REPR:-${ORIENT_REPR_DEFAULT}}"
   --environment.nr_envs="${NR_ENVS:-4096}"
 )
 
@@ -68,13 +82,35 @@ COMMON_ARGS=(
 SPR_ONLY_ARGS=(
   --algorithm.expected_data_sha256="${DATA_SHA256}"
   --algorithm.milestone_every_evals="${MILESTONE_EVERY:-12}"
+  --algorithm.log_correction_residual="${LOG_RESIDUAL:-${LOG_RESIDUAL_DEFAULT}}"
 )
 
 # Encoder pre-training budget (env steps, not counted in total_timesteps); identical for every SSL method.
 PRETRAIN_ENV_STEPS="${PRETRAIN_ENV_STEPS:-50000000}"
 
 # set_method METHOD -> sets ALGO and METHOD_ARGS
+# PLAN_phase2: a suffix selects how the reward is corrected (trirl_ppo_spr only):
+#   _TH  theta-only mixing, newest encoder (Phase 1, the default without suffix)
+#   _FRZ the encoder keeps its pre-trained value during TRIRL, theta-only mixing (exact for a fixed encoder)
+#   _FN  online encoder, function-space mixing of every past discriminator (official trirl_ppo, full history)
 set_method() {
+  local scheme=""
+  case "$1" in *_TH|*_FRZ|*_FN) scheme="${1##*_}"; set -- "${1%_*}" ;; esac
+  set_base_method "$1" || return 1
+  if [[ "${PROTOCOL}" == v3 && "${ALGO}" != trirl_ppo_spr.* ]]; then
+    echo "PROTOCOL=v3 (rot6d observations) is only implemented for trirl_ppo_spr methods, not '$1'" >&2; return 1
+  fi
+  if [[ -n "${scheme}" ]]; then
+    if [[ "${ALGO}" != trirl_ppo_spr.* ]]; then echo "suffix _${scheme} needs a trirl_ppo_spr method, not '$1'" >&2; return 1; fi
+    case "${scheme}" in
+      TH)  METHOD_ARGS+=(--algorithm.correction_mode=theta --algorithm.freeze_encoder_online=False) ;;
+      FRZ) METHOD_ARGS+=(--algorithm.correction_mode=theta --algorithm.freeze_encoder_online=True) ;;
+      FN)  METHOD_ARGS+=(--algorithm.correction_mode=function --algorithm.freeze_encoder_online=False) ;;
+    esac
+  fi
+}
+
+set_base_method() {
   case "$1" in
     B0)  # old method: Boltzmann (DSM) encoder on pos_ort features
       ALGO="trirl_ppo_fb.flax_full_jit"
@@ -86,11 +122,12 @@ set_method() {
         --algorithm.dsm_alpha=0.001
         --algorithm.dsm_sigma=0.5
       ) ;;
-    B|S|SG|SC)  # same code (trirl_ppo_spr), same encoder / budgets; they differ only in the flags below
+    B|S|SG|SC|BG)  # same code (trirl_ppo_spr), same encoder / budgets; they differ only in the flags below
       ALGO="trirl_ppo_spr.flax_full_jit"
       METHOD_ARGS=(--algorithm.pretrain_env_steps="${PRETRAIN_ENV_STEPS}" --algorithm.ssl_loss=cosine --algorithm.w_sigreg=0.0)
       case "$1" in
         B)  METHOD_ARGS+=(--algorithm.predictor_mode=byol_s) ;;                                  # BYOL-S: 1-step predictor
+        BG) METHOD_ARGS+=(--algorithm.predictor_mode=byol_s --algorithm.w_sigreg=0.05) ;;        # BYOL-S + SIGReg (PLAN_phase2 D)
         S)  METHOD_ARGS+=(--algorithm.predictor_mode=spr --algorithm.spr_k=5) ;;                 # SPR: latent dynamics, K=5
         SG) METHOD_ARGS+=(--algorithm.predictor_mode=spr --algorithm.spr_k=5 --algorithm.w_sigreg=0.05) ;;   # SPR + SIGReg (LeJEPA)
         SC) METHOD_ARGS+=(--algorithm.predictor_mode=spr --algorithm.spr_k=5 --algorithm.ssl_loss=infonce --algorithm.infonce_temperature=0.1) ;;  # temporal InfoNCE control
@@ -112,7 +149,7 @@ set_method() {
       ALGO="trirl_ppo_byol_s.flax_full_jit"
       METHOD_ARGS=(--algorithm.pretrain_env_steps="${PRETRAIN_ENV_STEPS}") ;;
     *)
-      echo "unknown METHOD '$1' (known: B S SG SC L N B_NOGAE R B0)" >&2
+      echo "unknown METHOD '$1' (known: B BG S SG SC L N B_NOGAE R B0, optionally with _TH / _FRZ / _FN)" >&2
       return 1 ;;
   esac
   if [[ "${ALGO}" == trirl_ppo_spr.* ]]; then METHOD_ARGS+=("${SPR_ONLY_ARGS[@]}"); fi
@@ -120,10 +157,17 @@ set_method() {
 
 # one-line description of a method (wandb notes)
 method_desc() {
+  local scheme=""
+  case "$1" in *_TH|*_FRZ|*_FN) scheme=" [${1##*_}]"; set -- "${1%_*}" ;; esac
+  echo "$(base_method_desc "$1")${scheme}"
+}
+
+base_method_desc() {
   case "$1" in
     B)      echo "BYOL-S, 1-step predictor, cosine" ;;
     S)      echo "SPR, latent transition model, K=5, cosine" ;;
     SG)     echo "SPR (K=5) + SIGReg (w=0.05)" ;;
+    BG)     echo "BYOL-S + SIGReg (w=0.05)" ;;
     SC)     echo "temporal InfoNCE control (SPR model, K=5, T=0.1)" ;;
     L)      echo "LeJEPA-style latent prediction + SIGReg (K=5, no EMA/stop-grad), exploratory" ;;
     N)      echo "CPC-style bilinear InfoNCE (K=5, no EMA/stop-grad), exploratory" ;;

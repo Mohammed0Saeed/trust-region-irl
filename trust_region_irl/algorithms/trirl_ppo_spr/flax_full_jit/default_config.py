@@ -53,6 +53,11 @@ def get_config(algorithm_name):
     config.ssl_loss = "cosine"  # "cosine": SPR/BYOL normalised-L2 | "infonce": temporal InfoNCE (SPR appendix B) | "mse": LeJEPA-style, mean over latent dims | "bilinear_infonce": CPC-style unnormalised bilinear InfoNCE
     config.infonce_temperature = 0.1
     config.infonce_mask_radius = 0  # same-episode samples within this many steps are not used as negatives (0: exact duplicates only)
+    config.correction_mode = "theta"  # theta: mix theta only, newest encoder (Phase 1) | function: mix every past discriminator's reward (official trirl_ppo, full history)
+    config.log_correction_residual = False  # also keep the full-history buffer in theta mode and log the per-iteration FN - theta difference
+    config.fn_buffer_capacity = 0  # 0: every TRIRL iteration of the run (set automatically, stored with the checkpoint)
+    config.fn_chunk_size = 5  # discriminators evaluated at once in the function-space correction (memory vs speed)
+    config.freeze_encoder_online = False  # FRZ: the encoder keeps its pre-trained value during TRIRL; only theta is learned
     config.w_ssl = 1.0  # weight of the SSL loss (the sum over the K steps) relative to the BCE loss
     config.w_sigreg = 0.0  # weight of SIGReg (LeJEPA); 0 disables it. LeJEPA: (1-lam)*pred + lam*SIGReg with lam=0.05, i.e. w_sigreg/w_ssl ~ 0.053
     config.sigreg_slices = 256

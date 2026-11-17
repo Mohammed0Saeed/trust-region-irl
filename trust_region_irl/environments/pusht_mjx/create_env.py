@@ -12,6 +12,8 @@ def create_train_and_eval_env(config):
         eval_init_noise_xy=config.environment.eval_init_noise_xy,
         eval_init_noise_yaw=config.environment.eval_init_noise_yaw,
         preset_set=config.environment.preset_set,
+        orientation_repr=config.environment.get("orientation_repr", "quat"),
+        control_freq=config.environment.get("control_freq", 20),
     )
     train_env = PushT(**env_kwargs)
     train_env.general_properties = GeneralProperties
