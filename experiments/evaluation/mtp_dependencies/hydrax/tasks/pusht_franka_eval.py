@@ -143,11 +143,13 @@ def load_checkpoint(model_zip):
         return np.asarray(params["theta"], dtype=np.float32), {"params": params}, ckpt
     if set(params) == {"theta"}:  # linear feature-based trirl_ppo_fb reward: r = theta . phi (see is_linear_checkpoint)
         return np.asarray(params["theta"], dtype=np.float32), {"params": params}, ckpt
-    params = {_LAYER_RENAMES.get(name, name): value for name, value in params.items()}
-
+    # Boltzmann reward: the layer names are kept as stored, they match BoltzmannDiscriminatorFeatureBased
+    # (feat_denses_<i> for the hidden layers; the old _LAYER_RENAMES mapping broke loading of these checkpoints)
     # Fail loudly instead of silently running with randomly initialised layers
-    expected = {"feat_dense1", "feat_dense2", "feat_dense3", "feat_dense4", "theta", "energy_dense1", "energy_dense2"}
-    if set(params) != expected:
+    nr_hidden = sum(name.startswith("feat_denses_") for name in params)
+    expected = ({f"feat_denses_{i}" for i in range(nr_hidden)}
+                | {"feat_densefinal", "theta", "energy_dense1", "energy_dense2"})
+    if nr_hidden == 0 or set(params) != expected:
         raise ValueError(f"Unexpected discriminator layers in {model_zip}: {sorted(params)}")
 
     disc_params = {"params": params}
@@ -254,10 +256,24 @@ class PushTFranka(Task):
             elif is_linear_checkpoint(self.disc_params):
                 self.reward_kind = "linear"
                 self.linear_theta = jnp.asarray(self.theta, dtype=jnp.float32)
-                if self.linear_theta.shape[0] not in (2, 3):
-                    raise ValueError(f"Linear feature reward of {self.reward_path} has {self.linear_theta.shape[0]} "
-                                     f"features, expected 2 (pos_ort) or 3 (base_without_ctrl)")
-                print(f"Linear feature reward: {self.linear_theta.shape[0]}-D features")
+                self.feature_dim = int(self.linear_theta.shape[0])
+            else:
+                # Boltzmann reward: layer sizes read from the checkpoint, so any boltzmann_hidden_dims works
+                params = self.disc_params["params"]
+                nr_hidden = sum(name.startswith("feat_denses_") for name in params)
+                hidden_dims = [int(np.asarray(params[f"feat_denses_{i}"]["kernel"]).shape[1]) for i in range(nr_hidden)]
+                self.boltzmann_model = BoltzmannDiscriminatorFeatureBased(
+                    hidden_dims=",".join(str(d) for d in hidden_dims),
+                    latent_dim=int(np.asarray(params["theta"]).shape[0]),
+                    energy_hidden_dim=int(np.asarray(params["energy_dense1"]["kernel"]).shape[1]),
+                )
+                self.feature_dim = int(np.asarray(params["feat_denses_0"]["kernel"]).shape[0])
+            if self.reward_kind in ("linear", "fb"):
+                if self.feature_dim not in (2, 3):
+                    raise ValueError(f"Feature reward of {self.reward_path} takes {self.feature_dim}-D features, "
+                                     f"expected 2 (pos_ort) or 3 (base_without_ctrl)")
+                print(f"{'Linear' if self.reward_kind == 'linear' else 'Boltzmann'} feature reward: "
+                      f"{self.feature_dim}-D features")
         else:
             self.theta, self.disc_params = None, None
 
@@ -653,11 +669,12 @@ class PushTFranka(Task):
             return -1.0 * self._spr_reward(state)
 
         if self.reward_kind == "linear":
-            return -1.0 * jnp.dot(self._linear_features(state), self.linear_theta)
+            return -1.0 * jnp.dot(self._fb_features(state), self.linear_theta)
 
-        model = BoltzmannDiscriminatorFeatureBased()
-
-        reward = model.apply(self.disc_params, features, method=model.reward_only)
+        # Boltzmann reward, on the same body-frame features as the linear one (the old 2-D sensor features above
+        # used the inertial frame and ignored the 3-D runs)
+        model = self.boltzmann_model
+        reward = model.apply(self.disc_params, self._fb_features(state), method=model.reward_only)
         cost = -1.0 * reward
         
         return cost
@@ -680,7 +697,7 @@ class PushTFranka(Task):
         arm_v = state.qvel[jnp.array(self.dof_adr)]
         return jnp.concatenate([block, ee_rel, arm_q, arm_v])
 
-    def _linear_features(self, state: mjx.Data) -> jax.Array:
+    def _fb_features(self, state: mjx.Data) -> jax.Array:
         """The features PushT.feature_from_transition builds for trirl_ppo_fb, from the body frames (as in pusht_mjx):
         2-D pos_ort           [-pos_err, -orient_err]
         3-D base_without_ctrl [-pos_err, -orient_err, -ee_block]
@@ -691,7 +708,7 @@ class PushTFranka(Task):
                                             state.xquat[self.T_bid])
         pos_err = jnp.linalg.norm(block_pos)
         orient_err = 1.0 - jnp.clip(block_quat[0] * block_quat[0], 0.0, 1.0)
-        if self.linear_theta.shape[0] == 2:
+        if self.feature_dim == 2:
             return jnp.array([-pos_err, -orient_err])
         ee_rel = state.xpos[self.ee_body_id] - goal_pos
         ee_block = jnp.linalg.norm(ee_rel - block_pos)
