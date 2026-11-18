@@ -8,8 +8,8 @@ The cost is -reward of the checkpoint:
               or the Boltzmann feature encoder for boltzmann-feature-based runs
 
 Every pose is rolled out once (controller seeded with `seed`), stopping early on success. Success uses the same
-definition as PushT: position error < success_threshold (m) and orientation error < success_threshold (rad),
-both measured from the body frames of the block and the goal.
+rule as the policy rollouts (success.py: AND, SUM or COVERAGE), with errors and coverage measured from the body
+frames of the block and the goal.
 
 Outputs in output_dir:
     mtp_results.csv    final position / orientation error, success, status and steps of every pose
@@ -32,6 +32,8 @@ from mujoco import mjx
 from hydrax.algs import MTP
 from hydrax.ik import differential_IK, gravity_comp_torque
 from hydrax.tasks.pusht_franka_eval import PushTFranka
+
+from success import coverage, describe, is_success
 
 # Controller and simulation settings of pusht_franka_eval_mtp/pusht_mtp_eval.py
 NUM_SAMPLES = 128
@@ -105,18 +107,20 @@ def check_reward(task, encoder_type, obs_type):
 
 
 def goal_errors(task, mj_data):
-    """Position error (m) and orientation error (rad) of the block, as PushT._goal_errors computes them."""
-    pos_err = float(np.linalg.norm(mj_data.xpos[task.T_bid] - mj_data.xpos[task.goal_bid]))
+    """Position error (m) and orientation error (rad) of the block, as PushT._goal_errors computes them,
+    and the coverage of the goal T (success.coverage), all from the body frames of the block and the goal."""
+    rel_pos = mj_data.xpos[task.T_bid] - mj_data.xpos[task.goal_bid]
+    pos_err = float(np.linalg.norm(rel_pos))
     rel_quat = np.zeros(4)
     goal_conj = np.zeros(4)
     mujoco.mju_negQuat(goal_conj, mj_data.xquat[task.goal_bid])
     mujoco.mju_mulQuat(rel_quat, goal_conj, mj_data.xquat[task.T_bid])
     w = abs(float(rel_quat[0]))  # w >= 0: the shorter of the two equivalent rotations
     orn_err = float(2.0 * np.arccos(np.clip(w, -1.0, 1.0)))
-    return pos_err, orn_err
+    return pos_err, orn_err, coverage(rel_pos[0:2], rel_quat)
 
 
-def roll_out_pose(task, ctrl, jit_optimize, pose, seed, success_threshold):
+def roll_out_pose(task, ctrl, jit_optimize, pose, seed, success_threshold, success_mode="AND"):
     """One MTP episode from the block pose [x, y, angle]; returns its final errors and status."""
     x, y, angle = (float(v) for v in pose)
     task.det_init = {"block_pos_x": x, "block_pos_y": y, "block_angle": angle, "ee_goal_pos": list(EE_GOAL_POS)}
@@ -158,13 +162,12 @@ def roll_out_pose(task, ctrl, jit_optimize, pose, seed, success_threshold):
         if status == "nan":
             break
 
-        pos_err, orn_err = goal_errors(task, mj_data)
-        if pos_err < success_threshold and orn_err < success_threshold:
+        if is_success(success_mode, success_threshold, *goal_errors(task, mj_data)):
             status = "success"
             break
 
-    pos_err, orn_err = goal_errors(task, mj_data)
-    return {"pos_err": pos_err, "orient_err": orn_err, "success": int(status == "success"),
+    pos_err, orn_err, cov = goal_errors(task, mj_data)
+    return {"pos_err": pos_err, "orient_err": orn_err, "coverage": cov, "success": int(status == "success"),
             "status": status, "steps": step}
 
 
@@ -173,7 +176,8 @@ def stack_trees(trees):
     return jax.tree_util.tree_map(lambda *leaves: jnp.stack(leaves), *trees)
 
 
-def roll_out_poses_parallel(task, ctrl, batch_optimize, batch_get_action, poses, seed, success_threshold):
+def roll_out_poses_parallel(task, ctrl, batch_optimize, batch_get_action, poses, seed, success_threshold,
+                            success_mode="AND"):
     """MTP episodes from several block poses at once: one batched (vmapped) planner call per control step for
     all poses, the cheap CPU part (IK, gravity compensation, mj_step) per pose. Each pose gets the same reset,
     controller seed and success / stop rule as roll_out_pose; a pose that has finished is no longer stepped."""
@@ -231,8 +235,7 @@ def roll_out_poses_parallel(task, ctrl, batch_optimize, batch_get_action, poses,
             if status[i] != "running":
                 continue
             steps[i] = step
-            pos_err, orn_err = goal_errors(task, mj_datas[i])
-            if pos_err < success_threshold and orn_err < success_threshold:
+            if is_success(success_mode, success_threshold, *goal_errors(task, mj_datas[i])):
                 status[i] = "success"
         if all(s != "running" for s in status):
             break
@@ -241,19 +244,20 @@ def roll_out_poses_parallel(task, ctrl, batch_optimize, batch_get_action, poses,
     for i in range(nr):
         if status[i] == "running":
             status[i] = "timeout"
-        pos_err, orn_err = goal_errors(task, mj_datas[i])
-        results.append({"pos_err": pos_err, "orient_err": orn_err, "success": int(status[i] == "success"),
-                        "status": status[i], "steps": steps[i]})
+        pos_err, orn_err, cov = goal_errors(task, mj_datas[i])
+        results.append({"pos_err": pos_err, "orient_err": orn_err, "coverage": cov,
+                        "success": int(status[i] == "success"), "status": status[i], "steps": steps[i]})
     return results
 
 
 def run_mtp(t_pos, checkpoint_path, encoder_type, obs_type, seed, success_threshold, output_dir, pose_indices=None,
-            parallel=False, batch_size=MTP_BATCH_SIZE):
+            parallel=False, batch_size=MTP_BATCH_SIZE, success_mode="AND"):
     """Roll out MTP with the checkpoint's reward as cost from poses of t_pos ((nr, 3) [x, y, angle], world frame).
 
     pose_indices: which poses of t_pos to run (0-based); None runs all of them.
     parallel: roll the poses out together, batch_size poses per batched planner call (lower it if the GPU runs out
               of memory); False rolls them out one after the other.
+    success_mode / success_threshold: see success.py (AND, SUM or COVERAGE).
     t_pos=None loads output_dir/t_config.npy (saved by rollout_policy). Returns one result dict per pose.
     """
     output_dir = Path(output_dir)
@@ -278,26 +282,26 @@ def run_mtp(t_pos, checkpoint_path, encoder_type, obs_type, seed, success_thresh
             chunk = pose_indices[chunk_start:chunk_start + batch_size]
             start = time.time()
             chunk_results = roll_out_poses_parallel(task, ctrl, batch_optimize, batch_get_action,
-                                                    t_pos[chunk], seed, success_threshold)
+                                                    t_pos[chunk], seed, success_threshold, success_mode)
             print(f"MTP poses {chunk[0] + 1}-{chunk[-1] + 1} in parallel ({time.time() - start:.1f} s)")
             for i, r in zip(chunk, chunk_results):
                 pose = t_pos[i]
                 r = {"pose": i + 1, "block_x_m": pose[0], "block_y_m": pose[1], "block_angle_rad": pose[2], **r}
                 results.append(r)
                 print(f"MTP pose {i + 1}/{len(t_pos)}: pos {r['pos_err']:.3f} m, ort {r['orient_err']:.3f} rad, "
-                      f"{r['status']} after {r['steps']} steps")
+                      f"cov {r['coverage']:.2f}, {r['status']} after {r['steps']} steps")
         pose_indices = []  # done; skip the sequential loop below
 
     jit_optimize = jax.jit(ctrl.optimize, donate_argnums=(1,))
     for i in pose_indices:
         pose = t_pos[i]
         start = time.time()
-        r = roll_out_pose(task, ctrl, jit_optimize, pose, seed, success_threshold)
+        r = roll_out_pose(task, ctrl, jit_optimize, pose, seed, success_threshold, success_mode)
         # "pose" is the 1-based row of t_config, so it matches the policy rollout from the same pose
         r = {"pose": i + 1, "block_x_m": pose[0], "block_y_m": pose[1], "block_angle_rad": pose[2], **r}
         results.append(r)
         print(f"MTP pose {i + 1}/{len(t_pos)}: pos {r['pos_err']:.3f} m, ort {r['orient_err']:.3f} rad, "
-              f"{r['status']} after {r['steps']} steps ({time.time() - start:.1f} s)")
+              f"cov {r['coverage']:.2f}, {r['status']} after {r['steps']} steps ({time.time() - start:.1f} s)")
 
     csv_path = output_dir / "mtp_results.csv"
     with open(csv_path, "w", newline="") as f:
@@ -305,5 +309,5 @@ def run_mtp(t_pos, checkpoint_path, encoder_type, obs_type, seed, success_thresh
         writer.writeheader()
         writer.writerows(results)
     print(f"Saved {csv_path}")
-    print(f"MTP success {sum(r['success'] for r in results)}/{len(results)} (threshold {success_threshold})")
+    print(f"MTP success {sum(r['success'] for r in results)}/{len(results)} ({describe(success_mode, success_threshold)})")
     return results

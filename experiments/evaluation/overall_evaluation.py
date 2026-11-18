@@ -95,17 +95,22 @@ def seed_stats(rows):
     }
 
 
-def algorithm_type(exp_dir):
-    """CHECK_POINT_TYPE of the evaluation (TRIRL / RL-PPO), from evaluation_info.json written by the pipeline.
-    Older evaluations have no such file: only TRIRL evaluations plot a reward (reward_plot.png)."""
+def evaluation_settings(exp_dir):
+    """(algorithm, success rule) of the evaluation, from evaluation_info.json written by the pipeline.
+    Older evaluations have no such file: only TRIRL evaluations plot a reward (reward_plot.png), and they used
+    the AND rule (threshold not recorded)."""
     info_path = exp_dir / "evaluation_info.json"
+    info = {}
     if info_path.is_file():
         with open(info_path) as f:
-            return json.load(f).get("check_point_type", "unknown")
-    return "TRIRL" if any(exp_dir.glob("seed*/reward_plot.png")) else "RL-PPO"
+            info = json.load(f)
+    algorithm = info.get("check_point_type") or ("TRIRL" if any(exp_dir.glob("seed*/reward_plot.png")) else "RL-PPO")
+    threshold = info.get("success_threshold")
+    rule = f"{info.get('success_mode', 'AND')} {threshold if threshold is not None else '?'}"
+    return algorithm, rule
 
 
-def overview_row(experiment, algorithm, policy_seeds, mtp_seeds):
+def overview_row(experiment, algorithm, rule, policy_seeds, mtp_seeds):
     """One line per experiment: policy and MTP side by side. Errors are mean final total errors (pos + orient);
     the best seed is chosen on the policy rollouts (highest success rate, lowest mean total error as tie-breaker)."""
     policy = seed_stats([r for rows in policy_seeds.values() for r in rows]) if policy_seeds else None
@@ -118,6 +123,7 @@ def overview_row(experiment, algorithm, policy_seeds, mtp_seeds):
     return {
         "experiment": experiment,
         "algorithm": algorithm,
+        "success_rule": rule,
         "seeds": len(seeds),
         "rollouts": (policy or mtp)["rollouts"],
         "mean_err": policy["mean_total_err"] if policy else None,
@@ -135,19 +141,21 @@ def print_overview(rows):
     def num(value, fmt):
         return "-" if value is None else format(value, fmt)
 
-    header = (f"{'Experiment':<40} | {'Algorithm':<9} | {'Seeds':>5} | {'Rollouts':>8} | {'Mean err':>8} | {'MTP mean err':>12} | "
+    header = (f"{'Experiment':<40} | {'Algorithm':<9} | {'Success rule':<14} | {'Seeds':>5} | {'Rollouts':>8} | {'Mean err':>8} | {'MTP mean err':>12} | "
               f"{'Succ (%)':>8} | {'Succ':>4} | {'MTP succ (%)':>12} | {'MTP succ':>8} | Best seed")
     print("-" * len(header))
     print(header)
     print("-" * len(header))
     for r in rows:
-        print(f"{r['experiment']:<40} | {r['algorithm']:<9} | {r['seeds']:>5} | {r['rollouts']:>8} | {num(r['mean_err'], '.4f'):>8} | "
+        print(f"{r['experiment']:<40} | {r['algorithm']:<9} | {r['success_rule']:<14} | {r['seeds']:>5} | {r['rollouts']:>8} | {num(r['mean_err'], '.4f'):>8} | "
               f"{num(r['mtp_mean_err'], '.4f'):>12} | {num(r['success_rate'], '.1f'):>7}% | "
               f"{num(r['successes'], 'd'):>4} | {num(r['mtp_success_rate'], '.1f'):>11}% | "
               f"{num(r['mtp_successes'], 'd'):>8} | {r['best_seed'] or '-'}")
     print("-" * len(header))
     print("Mean err = mean final total error (position + orientation) of the policy rollouts; "
           "best seed is chosen on the policy rollouts.")
+    print("Success rule: AND = pos_err < thr and ort_err < thr, SUM = pos_err + ort_err < thr, "
+          "COVERAGE = coverage > thr (rates under different rules are not comparable).")
 
 
 def add_sheet(wb, title, rows, percent_cols=(), error_cols=()):
@@ -179,12 +187,12 @@ def main():
 
     exp_dirs = experiment_dirs(args.paths)
     data = collect(exp_dirs)
-    algorithms = {d.name: algorithm_type(d) for d in exp_dirs}
+    settings = {d.name: evaluation_settings(d) for d in exp_dirs}
     if not data:
         sys.exit(f"No {' or '.join(RESULT_FILES.values())} found under {', '.join(map(str, args.paths))}")
 
     experiments = sorted({exp for exp, _ in data})
-    overview = [overview_row(exp, algorithms[exp], data.get((exp, "policy"), {}), data.get((exp, "mtp"), {}))
+    overview = [overview_row(exp, *settings[exp], data.get((exp, "policy"), {}), data.get((exp, "mtp"), {}))
                 for exp in experiments]
     per_seed = [{"experiment": exp, "method": method, "seed": seed, **seed_stats(rows)}
                 for (exp, method), seeds in sorted(data.items()) for seed, rows in seeds.items()]

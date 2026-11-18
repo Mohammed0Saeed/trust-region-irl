@@ -10,6 +10,10 @@ ENCODER_TYPE="SPR"  # Options: "SPR" or "FEATURES"
 OBS_TYPE="TASK-BASED" # Options: "TASK-BASED" or "JOINT-TASK-BASED"
 SEED=0
 SUCCESS_THRESHOLD=0.05
+# Options: "AND" (pos_err < thr and ort_err < thr),
+# "SUM" (pos_err + ort_err < thr) or
+# "COVERAGE" (coverage > thr, use thr 0.95 as in Diffusion Policy)
+SUCCESS_MODE="SUM"
 PARALLEL_MTP=true # Options: true (all MTP poses of a seed in one batched GPU call) or false (one pose after the other)
 OUTPUT_DIR="$(dirname "$0")/../evaluations_02"  # experiments/evaluations
 
@@ -22,10 +26,11 @@ python evaluation_pipeline.py \
     "$SEED" \
     "$SUCCESS_THRESHOLD" \
     "$OUTPUT_DIR" \
-    --parallel-mtp "$PARALLEL_MTP"
+    --parallel-mtp "$PARALLEL_MTP" \
+    --success-mode "$SUCCESS_MODE"
 
-# Overall evaluation of this experiment alone -> OUTPUT_DIR/EXPERIMENT_NAME/overall_evaluation.xlsx
-python overall_evaluation.py "$OUTPUT_DIR/$EXPERIMENT_NAME"
+# Overall evaluation of this experiment alone -> OUTPUT_DIR/EXPERIMENT_NAME_SUCCESS_MODE/overall_evaluation.xlsx
+python overall_evaluation.py "$OUTPUT_DIR/${EXPERIMENT_NAME}_${SUCCESS_MODE}"
 
 # Compare every experiment evaluated into OUTPUT_DIR so far -> OUTPUT_DIR/overall_evaluation.xlsx
 python overall_evaluation.py "$OUTPUT_DIR"

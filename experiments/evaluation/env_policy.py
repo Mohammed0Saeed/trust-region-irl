@@ -11,7 +11,9 @@ Outputs in output_dir:
     rollout_<k>.mp4      one video per rollout (k = 1..nr_rollouts), captioned with its final error and status
     initial_poses.csv    start pose [x, y, angle] of every rollout
     t_config.npy         the same poses as a (nr_rollouts, 3) float array, loaded by MTP
-    policy_results.csv   final position / orientation error, success, status and steps of every rollout
+    policy_results.csv   final position / orientation error, coverage, success, status and steps of every rollout
+
+A rollout stops at its first success under the chosen success mode (success.py: AND, SUM or COVERAGE).
 """
 import csv
 import os
@@ -32,6 +34,7 @@ from PIL import Image, ImageDraw, ImageFont
 from trust_region_irl.environments.pusht_mjx.environment import PushT
 from trust_region_irl.algorithms.trirl_ppo_spr.flax_full_jit.policy import Policy, get_processed_action_function
 from plot_rewards import load_checkpoint
+from success import coverage, describe, is_success
 
 NR_ROLLOUTS = 10
 LIGHT_FACTOR = 2.5 # scale of the scene light intensities (> 1 brightens)
@@ -107,8 +110,13 @@ def make_step_fn(env, config, policy_params):
     return step_fn
 
 
-def roll_out(env, step_fn, renderer, state):
-    """Roll every env out for one episode; return per-rollout frames and final results."""
+def roll_out(env, step_fn, renderer, state, success_mode, success_threshold):
+    """Roll every env out for one episode; return per-rollout frames and final results.
+
+    Success is checked here after every step with success.is_success (the env's own success termination is
+    switched off, see rollout_policy). The errors come from the env info and the coverage from
+    actual_next_observation (block pose relative to the goal, dims 0..6), which both still describe the final
+    state on the step an episode ends (state.data has already been reset then)."""
     nr = state.next_observation.shape[0]
     # reset leaves some info entries weakly typed and step returns them strongly typed, which would compile step twice
     state = jax.tree_util.tree_map(lambda x: jnp.asarray(x, dtype=x.dtype), state)
@@ -127,31 +135,36 @@ def roll_out(env, step_fn, renderer, state):
             frames[i].append(render(datas[i]) if running else frames[i][-1])
 
         state = step_fn(state)
-        terminated, truncated = np.asarray(state.terminated), np.asarray(state.truncated)
+        truncated = np.asarray(state.truncated)
         pos_err, orient_err = np.asarray(state.info["env_info/pos_err"]), np.asarray(state.info["env_info/orient_err"])
+        block_rel_goal = np.asarray(state.actual_next_observation)[:, 0:7]
         for i in range(nr):
             if results[i] is not None and results[i]["status"] != "running":
                 continue
+            cov = coverage(block_rel_goal[i, 0:2], block_rel_goal[i, 3:7])
             status = "running"
-            if terminated[i]:
+            if is_success(success_mode, success_threshold, float(pos_err[i]), float(orient_err[i]), cov):
                 status = "success"
             elif truncated[i]:
                 status = "timeout" if step + 1 >= env.horizon else "diverged"
-            results[i] = {"pos_err": float(pos_err[i]), "orient_err": float(orient_err[i]),
+            results[i] = {"pos_err": float(pos_err[i]), "orient_err": float(orient_err[i]), "coverage": cov,
                           "steps": step + 1, "status": status}
     return frames, results
 
 
-def rollout_policy(checkpoint_path, seed, success_threshold, output_dir, nr_rollouts=NR_ROLLOUTS):
+def rollout_policy(checkpoint_path, seed, success_threshold, output_dir, nr_rollouts=NR_ROLLOUTS, success_mode="AND"):
     """Roll the checkpoint's policy out from nr_rollouts random T poses (drawn from seed), save one video each.
 
+    success_mode / success_threshold: see success.py (AND, SUM or COVERAGE).
     Returns the (nr_rollouts, 3) start poses [x, y, angle], so the same poses can be reused (e.g. for MTP).
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     ckpt, config = load_checkpoint(checkpoint_path)
-    env = PushT(render=False, success_threshold=success_threshold)
+    # success_threshold=0 switches off the env's own success termination (pos_err < 0 never holds);
+    # success is checked in roll_out with the chosen mode instead
+    env = PushT(render=False, success_threshold=0.0)
 
     start_state = initial_states(env, seed, nr_rollouts)
     poses = block_poses(start_state)
@@ -171,13 +184,14 @@ def rollout_policy(checkpoint_path, seed, success_threshold, output_dir, nr_roll
     renderer = mujoco.Renderer(env.mj_model, HEIGHT, WIDTH)
     step_fn = make_step_fn(env, config, ckpt["policy"]["params"])
     print(f"Rolling out the policy from {nr_rollouts} random start poses ...")
-    frames, results = roll_out(env, step_fn, renderer, start_state)
+    frames, results = roll_out(env, step_fn, renderer, start_state, success_mode, success_threshold)
     renderer.close()
 
-    font = load_font(20)
+    font = load_font(18)
     for i in range(nr_rollouts):
         r = results[i]
-        label = f"rollout {i + 1}  |  pos {r['pos_err']:.3f} m  ort {r['orient_err']:.3f} rad  |  {r['status']}"
+        label = (f"rollout {i + 1} | pos {r['pos_err']:.3f} m  ort {r['orient_err']:.3f} rad  "
+                 f"cov {r['coverage']:.2f} | {r['status']}")
         out_path = output_dir / f"rollout_{i + 1}.mp4"
         with imageio.get_writer(out_path, fps=FPS, macro_block_size=None) as writer:
             for frame in frames[i]:
@@ -188,13 +202,13 @@ def rollout_policy(checkpoint_path, seed, success_threshold, output_dir, nr_roll
     results_path = output_dir / "policy_results.csv"
     with open(results_path, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["pose", "block_x_m", "block_y_m", "block_angle_rad", "pos_err", "orient_err",
+        writer.writerow(["pose", "block_x_m", "block_y_m", "block_angle_rad", "pos_err", "orient_err", "coverage",
                          "success", "status", "steps"])
         for i, (r, (x, y, angle)) in enumerate(zip(results, poses)):
-            writer.writerow([i + 1, x, y, angle, r["pos_err"], r["orient_err"],
+            writer.writerow([i + 1, x, y, angle, r["pos_err"], r["orient_err"], r["coverage"],
                              int(r["status"] == "success"), r["status"], r["steps"]])
     print(f"Saved {results_path}")
 
     nr_success = sum(r["status"] == "success" for r in results)
-    print(f"Success {nr_success}/{nr_rollouts} (threshold {success_threshold})")
+    print(f"Success {nr_success}/{nr_rollouts} ({describe(success_mode, success_threshold)})")
     return poses
