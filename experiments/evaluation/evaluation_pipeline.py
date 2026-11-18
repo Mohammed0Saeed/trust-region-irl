@@ -6,6 +6,7 @@
 Outputs go to OUTPUT_DIR/<EXPERIMENT_NAME>/seed<N>/, one folder per training seed of the experiment.
 """
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -29,7 +30,18 @@ def main():
     parser.add_argument("SEED", type=int, help="Seed for the random T configuration generator")
     parser.add_argument("SUCCESS_THRESHOLD", type=float, help="Threshold to determine if a policy is successful")
     parser.add_argument("OUTPUT_DIR", type=Path, nargs="?", default=DEFAULT_OUTPUT_DIR, help="Path to the output directory")
+    parser.add_argument("--parallel-mtp", type=str, default="false", choices=["true", "false"],
+                        help="Roll the MTP poses of a seed out in parallel (one batched planner call) instead of one by one")
     args = parser.parse_args()
+    parallel_mtp = args.parallel_mtp == "true"
+
+    # Settings of this evaluation, read by overall_evaluation.py (e.g. the algorithm type column)
+    experiment_dir = args.OUTPUT_DIR / args.EXPERIMENT_NAME
+    experiment_dir.mkdir(parents=True, exist_ok=True)
+    with open(experiment_dir / "evaluation_info.json", "w") as f:
+        json.dump({"check_point_type": args.CHECK_POINT_TYPE, "encoder_type": args.ENCODER_TYPE,
+                   "obs_type": args.OBS_TYPE, "seed": args.SEED, "success_threshold": args.SUCCESS_THRESHOLD,
+                   "parallel_mtp": parallel_mtp}, f, indent=2)
 
     paths = find_checkpoints_paths(experiment_name=args.EXPERIMENT_NAME, check_point_type=args.CHECK_POINT_TYPE)
     for path in paths:
@@ -50,11 +62,14 @@ def main():
         print(f"ROLLING OUT POLICY {args.EXPERIMENT_NAME}_{seed}")
         t_config = rollout_policy(path, seed=args.SEED, success_threshold=args.SUCCESS_THRESHOLD, output_dir=output_dir)
 
-        # Using the same T configs, run MTP and set the cost function to be the reward function if CHECK_POINT_TYPE = TRIRL
+        # Using the same T configs, run MTP and set the cost function to be the reward function if CHECK_POINT_TYPE = TRIRL.
+        # Every seed's reward is rolled out from all poses of t_config (the same 10 random poses as the policy).
         if args.CHECK_POINT_TYPE == "TRIRL":
-            print(f"RUNNING MTP {args.EXPERIMENT_NAME}_{seed}")
+            print(f"RUNNING MTP {args.EXPERIMENT_NAME}_{seed} FROM {len(t_config)} POSES"
+                  f"{' IN PARALLEL' if parallel_mtp else ''}")
             run_mtp(t_config, checkpoint_path=path, encoder_type=args.ENCODER_TYPE, obs_type=args.OBS_TYPE,
-                    seed=args.SEED, success_threshold=args.SUCCESS_THRESHOLD, output_dir=output_dir)
+                    seed=args.SEED, success_threshold=args.SUCCESS_THRESHOLD, output_dir=output_dir,
+                    parallel=parallel_mtp)
 
 
 if __name__ == "__main__":

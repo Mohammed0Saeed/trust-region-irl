@@ -48,6 +48,7 @@ KEEP_ELITES = 1
 BETA = 0.4
 MAX_STEP = 250
 EE_GOAL_POS = [0.45, 0.1, 0.035]  # end-effector start position, = PushT.GOAL_POS_EE
+MTP_BATCH_SIZE = 10  # poses per batched planner call with parallel=True (lower it if the GPU runs out of memory)
 
 SPR_INPUT_DIM = {"TASK-BASED": 7, "JOINT-TASK-BASED": 24}
 
@@ -167,9 +168,92 @@ def roll_out_pose(task, ctrl, jit_optimize, pose, seed, success_threshold):
             "status": status, "steps": step}
 
 
-def run_mtp(t_pos, checkpoint_path, encoder_type, obs_type, seed, success_threshold, output_dir):
-    """Roll out MTP with the checkpoint's reward as cost from every pose in t_pos ((nr, 3) [x, y, angle], world frame).
+def stack_trees(trees):
+    """Stack a list of identical pytrees into one pytree with a leading batch axis."""
+    return jax.tree_util.tree_map(lambda *leaves: jnp.stack(leaves), *trees)
 
+
+def roll_out_poses_parallel(task, ctrl, batch_optimize, batch_get_action, poses, seed, success_threshold):
+    """MTP episodes from several block poses at once: one batched (vmapped) planner call per control step for
+    all poses, the cheap CPU part (IK, gravity compensation, mj_step) per pose. Each pose gets the same reset,
+    controller seed and success / stop rule as roll_out_pose; a pose that has finished is no longer stepped."""
+    nr = len(poses)
+    mj_datas, params = [], []
+    for pose in poses:
+        x, y, angle = (float(v) for v in pose)
+        task.det_init = {"block_pos_x": x, "block_pos_y": y, "block_angle": angle, "ee_goal_pos": list(EE_GOAL_POS)}
+        mj_model, mj_data = task.reset(seed=seed)
+        mujoco.mj_forward(mj_model, mj_data)
+        mj_datas.append(mj_data)
+        params.append(ctrl.init_params(seed))
+    ctrl.set_seed(seed)
+    policy_params = stack_trees(params)
+
+    sim_steps_per_replan = max(int((1.0 / PLANNING_FREQUENCY) / mj_model.opt.timestep), 1)
+    # batched mjx state: built once, then only the fields that change are replaced every control step
+    mjx_data = stack_trees([mjx.put_data(mj_model, d).replace(mocap_pos=d.mocap_pos, mocap_quat=d.mocap_quat)
+                            for d in mj_datas])
+
+    status = ["running"] * nr
+    steps = [0] * nr
+    for step in range(1, MAX_STEP + 1):
+        mjx_data = mjx_data.replace(
+            qpos=jnp.array(np.stack([d.qpos for d in mj_datas])),
+            qvel=jnp.array(np.stack([d.qvel for d in mj_datas])),
+            mocap_pos=jnp.array(np.stack([d.mocap_pos for d in mj_datas])),
+            mocap_quat=jnp.array(np.stack([d.mocap_quat for d in mj_datas])),
+            time=jnp.array([d.time for d in mj_datas]),
+        )
+        policy_params = batch_optimize(mjx_data, policy_params)
+
+        running = [i for i in range(nr) if status[i] == "running"]
+        for k in range(sim_steps_per_replan):
+            actions = np.asarray(batch_get_action(policy_params, k * mj_model.opt.timestep))  # (nr, nu)
+            for i in running:
+                if status[i] != "running":
+                    continue
+                mj_data = mj_datas[i]
+                u = actions[i]
+                if ctrl.control_mapper is not None and task.actuation_type == "velocity":
+                    u = differential_IK(model=mj_model, data=mj_data, world_site_vel_desired=u)
+                if ctrl.gravity_compensator:
+                    tau_g = gravity_comp_torque(mj_model, mj_data)
+                    mj_data.qfrc_applied[:] = 0.0
+                    mj_data.xfrc_applied[:] = 0.0
+                    mj_data.qfrc_applied[task.actuator_joint_idxs] = tau_g[task.actuator_joint_idxs]
+                if np.isnan(u).any():
+                    status[i], steps[i] = "nan", step
+                    continue
+                mj_data.ctrl[:] = np.array(u)
+                mujoco.mj_step(mj_model, mj_data)
+
+        for i in running:
+            if status[i] != "running":
+                continue
+            steps[i] = step
+            pos_err, orn_err = goal_errors(task, mj_datas[i])
+            if pos_err < success_threshold and orn_err < success_threshold:
+                status[i] = "success"
+        if all(s != "running" for s in status):
+            break
+
+    results = []
+    for i in range(nr):
+        if status[i] == "running":
+            status[i] = "timeout"
+        pos_err, orn_err = goal_errors(task, mj_datas[i])
+        results.append({"pos_err": pos_err, "orient_err": orn_err, "success": int(status[i] == "success"),
+                        "status": status[i], "steps": steps[i]})
+    return results
+
+
+def run_mtp(t_pos, checkpoint_path, encoder_type, obs_type, seed, success_threshold, output_dir, pose_indices=None,
+            parallel=False, batch_size=MTP_BATCH_SIZE):
+    """Roll out MTP with the checkpoint's reward as cost from poses of t_pos ((nr, 3) [x, y, angle], world frame).
+
+    pose_indices: which poses of t_pos to run (0-based); None runs all of them.
+    parallel: roll the poses out together, batch_size poses per batched planner call (lower it if the GPU runs out
+              of memory); False rolls them out one after the other.
     t_pos=None loads output_dir/t_config.npy (saved by rollout_policy). Returns one result dict per pose.
     """
     output_dir = Path(output_dir)
@@ -177,16 +261,39 @@ def run_mtp(t_pos, checkpoint_path, encoder_type, obs_type, seed, success_thresh
     if t_pos is None:
         t_pos = np.load(output_dir / "t_config.npy")
     t_pos = np.asarray(t_pos, dtype=np.float64)
+    if pose_indices is None:
+        pose_indices = range(len(t_pos))
+    pose_indices = [int(i) for i in pose_indices]
 
     task = build_task(checkpoint_path)
     check_reward(task, encoder_type, obs_type)
     ctrl = build_controller(task, seed)
-    jit_optimize = jax.jit(ctrl.optimize, donate_argnums=(1,))
 
     results = []
-    for i, pose in enumerate(t_pos):
+    if parallel:
+        # only the updated params are returned, so XLA drops the sampled rollouts instead of keeping them for 10 poses
+        batch_optimize = jax.jit(jax.vmap(lambda data, params: ctrl.optimize(data, params)[0]), donate_argnums=(1,))
+        batch_get_action = jax.jit(jax.vmap(ctrl.get_action, in_axes=(0, None)))
+        for chunk_start in range(0, len(pose_indices), batch_size):
+            chunk = pose_indices[chunk_start:chunk_start + batch_size]
+            start = time.time()
+            chunk_results = roll_out_poses_parallel(task, ctrl, batch_optimize, batch_get_action,
+                                                    t_pos[chunk], seed, success_threshold)
+            print(f"MTP poses {chunk[0] + 1}-{chunk[-1] + 1} in parallel ({time.time() - start:.1f} s)")
+            for i, r in zip(chunk, chunk_results):
+                pose = t_pos[i]
+                r = {"pose": i + 1, "block_x_m": pose[0], "block_y_m": pose[1], "block_angle_rad": pose[2], **r}
+                results.append(r)
+                print(f"MTP pose {i + 1}/{len(t_pos)}: pos {r['pos_err']:.3f} m, ort {r['orient_err']:.3f} rad, "
+                      f"{r['status']} after {r['steps']} steps")
+        pose_indices = []  # done; skip the sequential loop below
+
+    jit_optimize = jax.jit(ctrl.optimize, donate_argnums=(1,))
+    for i in pose_indices:
+        pose = t_pos[i]
         start = time.time()
         r = roll_out_pose(task, ctrl, jit_optimize, pose, seed, success_threshold)
+        # "pose" is the 1-based row of t_config, so it matches the policy rollout from the same pose
         r = {"pose": i + 1, "block_x_m": pose[0], "block_y_m": pose[1], "block_angle_rad": pose[2], **r}
         results.append(r)
         print(f"MTP pose {i + 1}/{len(t_pos)}: pos {r['pos_err']:.3f} m, ort {r['orient_err']:.3f} rad, "

@@ -35,13 +35,12 @@ from trust_region_irl.algorithms.trirl_ppo_fb.flax_full_jit.discriminator import
 
 FEATURE_FN = {2: "pos_ort", 3: "base_without_ctrl"}
 SPR_INPUT_INDICES = {"TASK-BASED": (0, 1, 2, 3, 4, 5, 6),  # block position + quaternion
-                     "JOINT-TASK-BASED": ()}                # empty = full 24-D observation
+                     "JOINT-TASK-BASED": ()} # empty = full 24-D observation
 PUSHT_OBSERVATION_DIM = 24
-BLOCK_Z = 0.045      # block height the env spawns it at (PushT._reset)
-GRID = 100           # resolution of every sweep
-POS_RANGE = 0.4      # position heatmap spans [-POS_RANGE, POS_RANGE]^2 around the goal (m)
-EE_RANGE = 0.4       # end-effector distance sweep spans [0, EE_RANGE] (m)
-
+BLOCK_Z = 0.045 # block height the env spawns it at (PushT._reset)
+GRID = 100 # resolution of every sweep
+POS_RANGE = 0.4 # position heatmap spans [-POS_RANGE, POS_RANGE]^2 around the goal (m)
+EE_RANGE = 0.4 # end-effector distance sweep spans [0, EE_RANGE] (m)
 
 # ------------------------------------------------------------------ loading #
 def load_checkpoint(model_zip):

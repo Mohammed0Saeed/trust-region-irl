@@ -11,6 +11,7 @@ Outputs in output_dir:
     rollout_<k>.mp4      one video per rollout (k = 1..nr_rollouts), captioned with its final error and status
     initial_poses.csv    start pose [x, y, angle] of every rollout
     t_config.npy         the same poses as a (nr_rollouts, 3) float array, loaded by MTP
+    policy_results.csv   final position / orientation error, success, status and steps of every rollout
 """
 import csv
 import os
@@ -33,11 +34,11 @@ from trust_region_irl.algorithms.trirl_ppo_spr.flax_full_jit.policy import Polic
 from plot_rewards import load_checkpoint
 
 NR_ROLLOUTS = 10
-LIGHT_FACTOR = 2.5   # scale of the scene light intensities (> 1 brightens)
-GAMMA = 0.7          # gamma correction of the rendered pixels (< 1 brightens)
+LIGHT_FACTOR = 2.5 # scale of the scene light intensities (> 1 brightens)
+GAMMA = 0.7 # gamma correction of the rendered pixels (< 1 brightens)
 CAMERA = "comparison"
 WIDTH, HEIGHT = 640, 480
-FPS = 20             # the env's control frequency, so the videos play in real time
+FPS = 20 # the env's control frequency, so the videos play in real time
 CAPTION_HEIGHT = 44
 
 
@@ -182,6 +183,17 @@ def rollout_policy(checkpoint_path, seed, success_threshold, output_dir, nr_roll
             for frame in frames[i]:
                 writer.append_data(caption(frame, label, font))
         print(f"Saved {out_path}")
+
+    # final errors of every rollout, same columns as mtp_results.csv (read by overall_evaluation.py)
+    results_path = output_dir / "policy_results.csv"
+    with open(results_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["pose", "block_x_m", "block_y_m", "block_angle_rad", "pos_err", "orient_err",
+                         "success", "status", "steps"])
+        for i, (r, (x, y, angle)) in enumerate(zip(results, poses)):
+            writer.writerow([i + 1, x, y, angle, r["pos_err"], r["orient_err"],
+                             int(r["status"] == "success"), r["status"], r["steps"]])
+    print(f"Saved {results_path}")
 
     nr_success = sum(r["status"] == "success" for r in results)
     print(f"Success {nr_success}/{nr_rollouts} (threshold {success_threshold})")
