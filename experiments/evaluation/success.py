@@ -3,9 +3,9 @@
 SUCCESS_MODE (with SUCCESS_THRESHOLD = thr):
     AND       pos_err < thr and orient_err < thr     (m and rad; PushT's own rule)
     SUM       pos_err + orient_err < thr
-    COVERAGE  coverage > thr                          (Diffusion Policy, Chi et al. 2023, arXiv:2303.04137: success
-                                                       when coverage > 0.95, so use thr = 0.95 with this mode)
 
+Coverage (Diffusion Policy, Chi et al. 2023, arXiv:2303.04137) is not a success rule here: it is only recorded
+for every rollout and averaged in the overall evaluation.
 coverage = area(T block intersect goal T) / area(goal T), in the table plane. Both T's are the two boxes of
 scene_mjx_free.xml (bottom: centre (0, 0), half sizes (0.05, 0.025); top: centre (0.075, 0), half sizes
 (0.025, 0.06), in the body frame). The boxes of one T do not overlap, so the intersection area is the sum of the
@@ -13,7 +13,7 @@ pairwise rectangle intersections, computed exactly by convex polygon clipping.
 """
 import numpy as np
 
-SUCCESS_MODES = ("AND", "SUM", "COVERAGE")
+SUCCESS_MODES = ("AND", "SUM")
 
 T_BOX_CENTRES = np.array([[0.0, 0.0], [0.075, 0.0]])
 T_BOX_HALF_SIZES = np.array([[0.05, 0.025], [0.025, 0.06]])
@@ -81,17 +81,14 @@ def coverage(rel_xy, rel_quat):
     return float(min(overlap / T_AREA, 1.0))
 
 
-def is_success(mode, threshold, pos_err, orient_err, cov):
+def is_success(mode, threshold, pos_err, orient_err):
     if mode == "AND":
         return pos_err < threshold and orient_err < threshold
     if mode == "SUM":
         return pos_err + orient_err < threshold
-    if mode == "COVERAGE":
-        return cov > threshold
     raise ValueError(f"Unknown success mode {mode}, expected one of {SUCCESS_MODES}")
 
 
 def describe(mode, threshold):
     return {"AND": f"pos_err < {threshold} m and orient_err < {threshold} rad",
-            "SUM": f"pos_err + orient_err < {threshold}",
-            "COVERAGE": f"coverage > {threshold}"}[mode]
+            "SUM": f"pos_err + orient_err < {threshold}"}[mode]

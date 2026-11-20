@@ -8,11 +8,11 @@ The cost is -reward of the checkpoint:
               or the Boltzmann feature encoder for boltzmann-feature-based runs
 
 Every pose is rolled out once (controller seeded with `seed`), stopping early on success. Success uses the same
-rule as the policy rollouts (success.py: AND, SUM or COVERAGE), with errors and coverage measured from the body
-frames of the block and the goal.
+rule as the policy rollouts (success.py: AND or SUM), with errors and coverage measured from the body frames of
+the block and the goal. Coverage is only recorded, it does not decide success.
 
 Outputs in output_dir:
-    mtp_results.csv    final position / orientation error, success, status and steps of every pose
+    mtp_results.csv    final position / orientation error, coverage, success, status and steps of every pose
 """
 import csv
 import sys
@@ -162,7 +162,7 @@ def roll_out_pose(task, ctrl, jit_optimize, pose, seed, success_threshold, succe
         if status == "nan":
             break
 
-        if is_success(success_mode, success_threshold, *goal_errors(task, mj_data)):
+        if is_success(success_mode, success_threshold, *goal_errors(task, mj_data)[0:2]):
             status = "success"
             break
 
@@ -235,7 +235,7 @@ def roll_out_poses_parallel(task, ctrl, batch_optimize, batch_get_action, poses,
             if status[i] != "running":
                 continue
             steps[i] = step
-            if is_success(success_mode, success_threshold, *goal_errors(task, mj_datas[i])):
+            if is_success(success_mode, success_threshold, *goal_errors(task, mj_datas[i])[0:2]):
                 status[i] = "success"
         if all(s != "running" for s in status):
             break
@@ -257,7 +257,7 @@ def run_mtp(t_pos, checkpoint_path, encoder_type, obs_type, seed, success_thresh
     pose_indices: which poses of t_pos to run (0-based); None runs all of them.
     parallel: roll the poses out together, batch_size poses per batched planner call (lower it if the GPU runs out
               of memory); False rolls them out one after the other.
-    success_mode / success_threshold: see success.py (AND, SUM or COVERAGE).
+    success_mode / success_threshold: see success.py (AND or SUM).
     t_pos=None loads output_dir/t_config.npy (saved by rollout_policy). Returns one result dict per pose.
     """
     output_dir = Path(output_dir)

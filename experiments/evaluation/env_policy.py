@@ -13,7 +13,8 @@ Outputs in output_dir:
     t_config.npy         the same poses as a (nr_rollouts, 3) float array, loaded by MTP
     policy_results.csv   final position / orientation error, coverage, success, status and steps of every rollout
 
-A rollout stops at its first success under the chosen success mode (success.py: AND, SUM or COVERAGE).
+A rollout stops at its first success under the chosen success mode (success.py: AND or SUM). The coverage of
+the goal T is recorded for every rollout, but it does not decide success.
 """
 import csv
 import os
@@ -143,7 +144,7 @@ def roll_out(env, step_fn, renderer, state, success_mode, success_threshold):
                 continue
             cov = coverage(block_rel_goal[i, 0:2], block_rel_goal[i, 3:7])
             status = "running"
-            if is_success(success_mode, success_threshold, float(pos_err[i]), float(orient_err[i]), cov):
+            if is_success(success_mode, success_threshold, float(pos_err[i]), float(orient_err[i])):
                 status = "success"
             elif truncated[i]:
                 status = "timeout" if step + 1 >= env.horizon else "diverged"
@@ -155,7 +156,7 @@ def roll_out(env, step_fn, renderer, state, success_mode, success_threshold):
 def rollout_policy(checkpoint_path, seed, success_threshold, output_dir, nr_rollouts=NR_ROLLOUTS, success_mode="AND"):
     """Roll the checkpoint's policy out from nr_rollouts random T poses (drawn from seed), save one video each.
 
-    success_mode / success_threshold: see success.py (AND, SUM or COVERAGE).
+    success_mode / success_threshold: see success.py (AND or SUM).
     Returns the (nr_rollouts, 3) start poses [x, y, angle], so the same poses can be reused (e.g. for MTP).
     """
     output_dir = Path(output_dir)
