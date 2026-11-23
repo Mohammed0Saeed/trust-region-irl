@@ -11,10 +11,10 @@ Outputs in output_dir:
     rollout_<k>.mp4      one video per rollout (k = 1..nr_rollouts), captioned with its final error and status
     initial_poses.csv    start pose [x, y, angle] of every rollout
     t_config.npy         the same poses as a (nr_rollouts, 3) float array, loaded by MTP
-    policy_results.csv   final position / orientation error, coverage, success, status and steps of every rollout
+    policy_results.csv   final position / orientation error, IoU, success, status and steps of every rollout
 
-A rollout stops at its first success under the chosen success mode (success.py: AND or SUM). The coverage of
-the goal T is recorded for every rollout, but it does not decide success.
+A rollout stops at its first success under the chosen success mode (success.py: AND or SUM). The IoU of the
+block T and the goal T is recorded for every rollout, but it does not decide success.
 """
 import csv
 import os
@@ -35,7 +35,7 @@ from PIL import Image, ImageDraw, ImageFont
 from trust_region_irl.environments.pusht_mjx.environment import PushT
 from trust_region_irl.algorithms.trirl_ppo_spr.flax_full_jit.policy import Policy, get_processed_action_function
 from plot_rewards import load_checkpoint
-from success import coverage, describe, is_success
+from success import describe, iou, is_success
 
 NR_ROLLOUTS = 10
 LIGHT_FACTOR = 2.5 # scale of the scene light intensities (> 1 brightens)
@@ -115,7 +115,7 @@ def roll_out(env, step_fn, renderer, state, success_mode, success_threshold):
     """Roll every env out for one episode; return per-rollout frames and final results.
 
     Success is checked here after every step with success.is_success (the env's own success termination is
-    switched off, see rollout_policy). The errors come from the env info and the coverage from
+    switched off, see rollout_policy). The errors come from the env info and the IoU from
     actual_next_observation (block pose relative to the goal, dims 0..6), which both still describe the final
     state on the step an episode ends (state.data has already been reset then)."""
     nr = state.next_observation.shape[0]
@@ -142,13 +142,13 @@ def roll_out(env, step_fn, renderer, state, success_mode, success_threshold):
         for i in range(nr):
             if results[i] is not None and results[i]["status"] != "running":
                 continue
-            cov = coverage(block_rel_goal[i, 0:2], block_rel_goal[i, 3:7])
+            block_iou = iou(block_rel_goal[i, 0:2], block_rel_goal[i, 3:7])
             status = "running"
             if is_success(success_mode, success_threshold, float(pos_err[i]), float(orient_err[i])):
                 status = "success"
             elif truncated[i]:
                 status = "timeout" if step + 1 >= env.horizon else "diverged"
-            results[i] = {"pos_err": float(pos_err[i]), "orient_err": float(orient_err[i]), "coverage": cov,
+            results[i] = {"pos_err": float(pos_err[i]), "orient_err": float(orient_err[i]), "iou": block_iou,
                           "steps": step + 1, "status": status}
     return frames, results
 
@@ -192,7 +192,7 @@ def rollout_policy(checkpoint_path, seed, success_threshold, output_dir, nr_roll
     for i in range(nr_rollouts):
         r = results[i]
         label = (f"rollout {i + 1} | pos {r['pos_err']:.3f} m  ort {r['orient_err']:.3f} rad  "
-                 f"cov {r['coverage']:.2f} | {r['status']}")
+                 f"IoU {r['iou']:.2f} | {r['status']}")
         out_path = output_dir / f"rollout_{i + 1}.mp4"
         with imageio.get_writer(out_path, fps=FPS, macro_block_size=None) as writer:
             for frame in frames[i]:
@@ -203,10 +203,10 @@ def rollout_policy(checkpoint_path, seed, success_threshold, output_dir, nr_roll
     results_path = output_dir / "policy_results.csv"
     with open(results_path, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["pose", "block_x_m", "block_y_m", "block_angle_rad", "pos_err", "orient_err", "coverage",
+        writer.writerow(["pose", "block_x_m", "block_y_m", "block_angle_rad", "pos_err", "orient_err", "iou",
                          "success", "status", "steps"])
         for i, (r, (x, y, angle)) in enumerate(zip(results, poses)):
-            writer.writerow([i + 1, x, y, angle, r["pos_err"], r["orient_err"], r["coverage"],
+            writer.writerow([i + 1, x, y, angle, r["pos_err"], r["orient_err"], r["iou"],
                              int(r["status"] == "success"), r["status"], r["steps"]])
     print(f"Saved {results_path}")
 

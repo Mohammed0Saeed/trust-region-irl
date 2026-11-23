@@ -38,7 +38,7 @@ def main():
     parser.add_argument("OUTPUT_DIR", type=Path, nargs="?", default=DEFAULT_OUTPUT_DIR, help="Path to the output directory")
     parser.add_argument("--success-mode", type=str, default="AND", choices=list(SUCCESS_MODES),
                         help="AND: pos_err < thr and ort_err < thr; SUM: pos_err + ort_err < thr "
-                             "(coverage is always recorded, but never decides success)")
+                             "(the IoU with the goal T is always recorded, but never decides success)")
     parser.add_argument("--parallel-mtp", type=str, default="false", choices=["true", "false"],
                         help="Roll the MTP poses of a seed out in parallel (one batched planner call) instead of one by one")
     args = parser.parse_args()

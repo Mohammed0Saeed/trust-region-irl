@@ -4,12 +4,13 @@ SUCCESS_MODE (with SUCCESS_THRESHOLD = thr):
     AND       pos_err < thr and orient_err < thr     (m and rad; PushT's own rule)
     SUM       pos_err + orient_err < thr
 
-Coverage (Diffusion Policy, Chi et al. 2023, arXiv:2303.04137) is not a success rule here: it is only recorded
-for every rollout and averaged in the overall evaluation.
-coverage = area(T block intersect goal T) / area(goal T), in the table plane. Both T's are the two boxes of
+The intersection over union (IoU) of the block T and the goal T is not a success rule: it is only recorded for
+every rollout and averaged in the overall evaluation.
+iou = area(T block intersect goal T) / area(T block union goal T), in the table plane. Both T's are the two boxes of
 scene_mjx_free.xml (bottom: centre (0, 0), half sizes (0.05, 0.025); top: centre (0.075, 0), half sizes
 (0.025, 0.06), in the body frame). The boxes of one T do not overlap, so the intersection area is the sum of the
-pairwise rectangle intersections, computed exactly by convex polygon clipping.
+pairwise rectangle intersections, computed exactly by convex polygon clipping. Both T's have the same area A, so
+the union is 2A - intersection.
 """
 import numpy as np
 
@@ -70,15 +71,15 @@ def planar_yaw(quat):
     return float(np.arctan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z)))
 
 
-def coverage(rel_xy, rel_quat):
-    """Fraction of the goal T covered by the block, from the block pose relative to the goal
+def iou(rel_xy, rel_quat):
+    """Intersection over union of the block T and the goal T, from the block pose relative to the goal
     (position rel_xy and quaternion rel_quat = conj(goal) * block, as in the PushT observation dims 0..6)."""
     if not np.all(np.isfinite(rel_xy)) or not np.all(np.isfinite(rel_quat)):
         return 0.0
     goal = _t_rectangles(0.0, 0.0, 0.0)
     block = _t_rectangles(float(rel_xy[0]), float(rel_xy[1]), planar_yaw(rel_quat))
-    overlap = sum(_area(_clip(b, g)) for b in block for g in goal)
-    return float(min(overlap / T_AREA, 1.0))
+    overlap = min(sum(_area(_clip(b, g)) for b in block for g in goal), T_AREA)
+    return float(overlap / (2.0 * T_AREA - overlap))
 
 
 def is_success(mode, threshold, pos_err, orient_err):

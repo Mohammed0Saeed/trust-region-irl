@@ -8,11 +8,11 @@ The cost is -reward of the checkpoint:
               or the Boltzmann feature encoder for boltzmann-feature-based runs
 
 Every pose is rolled out once (controller seeded with `seed`), stopping early on success. Success uses the same
-rule as the policy rollouts (success.py: AND or SUM), with errors and coverage measured from the body frames of
-the block and the goal. Coverage is only recorded, it does not decide success.
+rule as the policy rollouts (success.py: AND or SUM), with errors and IoU measured from the body frames of the
+block and the goal. The IoU is only recorded, it does not decide success.
 
 Outputs in output_dir:
-    mtp_results.csv    final position / orientation error, coverage, success, status and steps of every pose
+    mtp_results.csv    final position / orientation error, IoU, success, status and steps of every pose
 """
 import csv
 import sys
@@ -33,7 +33,7 @@ from hydrax.algs import MTP
 from hydrax.ik import differential_IK, gravity_comp_torque
 from hydrax.tasks.pusht_franka_eval import PushTFranka
 
-from success import coverage, describe, is_success
+from success import describe, iou, is_success
 
 # Controller and simulation settings of pusht_franka_eval_mtp/pusht_mtp_eval.py
 NUM_SAMPLES = 128
@@ -108,7 +108,7 @@ def check_reward(task, encoder_type, obs_type):
 
 def goal_errors(task, mj_data):
     """Position error (m) and orientation error (rad) of the block, as PushT._goal_errors computes them,
-    and the coverage of the goal T (success.coverage), all from the body frames of the block and the goal."""
+    and the IoU of the block T and the goal T (success.iou), all from the body frames of the block and the goal."""
     rel_pos = mj_data.xpos[task.T_bid] - mj_data.xpos[task.goal_bid]
     pos_err = float(np.linalg.norm(rel_pos))
     rel_quat = np.zeros(4)
@@ -117,7 +117,7 @@ def goal_errors(task, mj_data):
     mujoco.mju_mulQuat(rel_quat, goal_conj, mj_data.xquat[task.T_bid])
     w = abs(float(rel_quat[0]))  # w >= 0: the shorter of the two equivalent rotations
     orn_err = float(2.0 * np.arccos(np.clip(w, -1.0, 1.0)))
-    return pos_err, orn_err, coverage(rel_pos[0:2], rel_quat)
+    return pos_err, orn_err, iou(rel_pos[0:2], rel_quat)
 
 
 def roll_out_pose(task, ctrl, jit_optimize, pose, seed, success_threshold, success_mode="AND"):
@@ -166,8 +166,8 @@ def roll_out_pose(task, ctrl, jit_optimize, pose, seed, success_threshold, succe
             status = "success"
             break
 
-    pos_err, orn_err, cov = goal_errors(task, mj_data)
-    return {"pos_err": pos_err, "orient_err": orn_err, "coverage": cov, "success": int(status == "success"),
+    pos_err, orn_err, block_iou = goal_errors(task, mj_data)
+    return {"pos_err": pos_err, "orient_err": orn_err, "iou": block_iou, "success": int(status == "success"),
             "status": status, "steps": step}
 
 
@@ -244,8 +244,8 @@ def roll_out_poses_parallel(task, ctrl, batch_optimize, batch_get_action, poses,
     for i in range(nr):
         if status[i] == "running":
             status[i] = "timeout"
-        pos_err, orn_err, cov = goal_errors(task, mj_datas[i])
-        results.append({"pos_err": pos_err, "orient_err": orn_err, "coverage": cov,
+        pos_err, orn_err, block_iou = goal_errors(task, mj_datas[i])
+        results.append({"pos_err": pos_err, "orient_err": orn_err, "iou": block_iou,
                         "success": int(status[i] == "success"), "status": status[i], "steps": steps[i]})
     return results
 
@@ -289,7 +289,7 @@ def run_mtp(t_pos, checkpoint_path, encoder_type, obs_type, seed, success_thresh
                 r = {"pose": i + 1, "block_x_m": pose[0], "block_y_m": pose[1], "block_angle_rad": pose[2], **r}
                 results.append(r)
                 print(f"MTP pose {i + 1}/{len(t_pos)}: pos {r['pos_err']:.3f} m, ort {r['orient_err']:.3f} rad, "
-                      f"cov {r['coverage']:.2f}, {r['status']} after {r['steps']} steps")
+                      f"IoU {r['iou']:.2f}, {r['status']} after {r['steps']} steps")
         pose_indices = []  # done; skip the sequential loop below
 
     jit_optimize = jax.jit(ctrl.optimize, donate_argnums=(1,))
@@ -301,7 +301,7 @@ def run_mtp(t_pos, checkpoint_path, encoder_type, obs_type, seed, success_thresh
         r = {"pose": i + 1, "block_x_m": pose[0], "block_y_m": pose[1], "block_angle_rad": pose[2], **r}
         results.append(r)
         print(f"MTP pose {i + 1}/{len(t_pos)}: pos {r['pos_err']:.3f} m, ort {r['orient_err']:.3f} rad, "
-              f"cov {r['coverage']:.2f}, {r['status']} after {r['steps']} steps ({time.time() - start:.1f} s)")
+              f"IoU {r['iou']:.2f}, {r['status']} after {r['steps']} steps ({time.time() - start:.1f} s)")
 
     csv_path = output_dir / "mtp_results.csv"
     with open(csv_path, "w", newline="") as f:

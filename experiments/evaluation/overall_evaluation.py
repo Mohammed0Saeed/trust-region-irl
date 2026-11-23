@@ -6,8 +6,8 @@ Reads the results evaluation_pipeline.py writes into <evaluations>/<project>/<ex
     mtp_results.csv      MTP with the reward as cost, from the same poses
 
 For every experiment and method (policy / mtp) it reports the success rate over all seeds and poses, the mean
-final errors (total = position + orientation, as in the old evaluation scripts), the mean final coverage of the
-goal T (Diffusion Policy's measure, recorded only, it does not decide success) and the best seed (highest success
+final errors (total = position + orientation, as in the old evaluation scripts), the mean final IoU of the block
+T and the goal T (recorded only, it does not decide success) and the best seed (highest success
 rate, lowest mean total error as tie-breaker).
 
 Prints the overview and writes <evaluations>/overall_evaluation.xlsx with three sheets:
@@ -48,9 +48,9 @@ def read_results(csv_path):
         rows = []
         for r in csv.DictReader(f):
             pos_err, orient_err = float(r["pos_err"]), float(r["orient_err"])
-            cov = r.get("coverage")  # older results files have no coverage column
+            block_iou = r.get("iou")  # older results files have no IoU column
             rows.append({"pose": int(r["pose"]), "pos_err": pos_err, "orient_err": orient_err,
-                         "total_err": pos_err + orient_err, "coverage": float(cov) if cov else None,
+                         "total_err": pos_err + orient_err, "iou": float(block_iou) if block_iou else None,
                          "success": int(r["success"]),
                          "status": r["status"], "steps": int(r["steps"])})
         return rows
@@ -101,10 +101,10 @@ def collect(exp_dirs):
 
 
 # -------------------------------------------------------------- statistics #
-def mean_coverage(rows):
-    """Mean final coverage (fraction 0..1) over the rows that recorded it, None if none did."""
-    covs = [r["coverage"] for r in rows if r["coverage"] is not None]
-    return float(np.mean(covs)) if covs else None
+def mean_iou(rows):
+    """Mean final IoU (fraction 0..1) over the rows that recorded it, None if none did."""
+    values = [r["iou"] for r in rows if r["iou"] is not None]
+    return float(np.mean(values)) if values else None
 
 
 def seed_stats(rows):
@@ -113,7 +113,7 @@ def seed_stats(rows):
         "mean_pos_err": float(np.mean([r["pos_err"] for r in rows])),
         "mean_orient_err": float(np.mean([r["orient_err"] for r in rows])),
         "mean_total_err": float(np.mean([r["total_err"] for r in rows])),
-        "mean_coverage": mean_coverage(rows),
+        "mean_iou": mean_iou(rows),
         "successes": sum(r["success"] for r in rows),
         "rollouts": len(rows),
         "mean_steps": float(np.mean([r["steps"] for r in rows])),
@@ -153,8 +153,8 @@ def overview_row(experiment, algorithm, rule, policy_seeds, mtp_seeds):
         "rollouts": (policy or mtp)["rollouts"],
         "mean_err": policy["mean_total_err"] if policy else None,
         "mtp_mean_err": mtp["mean_total_err"] if mtp else None,
-        "mean_coverage": policy["mean_coverage"] if policy else None,
-        "mtp_mean_coverage": mtp["mean_coverage"] if mtp else None,
+        "mean_iou": policy["mean_iou"] if policy else None,
+        "mtp_mean_iou": mtp["mean_iou"] if mtp else None,
         "success_rate": policy["success_rate"] if policy else None,
         "successes": policy["successes"] if policy else None,
         "mtp_success_rate": mtp["success_rate"] if mtp else None,
@@ -173,19 +173,19 @@ def print_overview(rows):
 
     w = max([len("Experiment")] + [len(r["experiment"]) for r in rows])
     header = (f"{'Experiment':<{w}} | {'Algorithm':<9} | {'Success rule':<14} | {'Seeds':>5} | {'Rollouts':>8} | {'Mean err':>8} | {'MTP mean err':>12} | "
-              f"{'Cov (%)':>7} | {'MTP cov (%)':>11} | {'Succ (%)':>8} | {'Succ':>4} | {'MTP succ (%)':>12} | {'MTP succ':>8} | Best seed")
+              f"{'IoU (%)':>7} | {'MTP IoU (%)':>11} | {'Succ (%)':>8} | {'Succ':>4} | {'MTP succ (%)':>12} | {'MTP succ':>8} | Best seed")
     print("-" * len(header))
     print(header)
     print("-" * len(header))
     for r in rows:
         print(f"{r['experiment']:<{w}} | {r['algorithm']:<9} | {r['success_rule']:<14} | {r['seeds']:>5} | {r['rollouts']:>8} | {num(r['mean_err'], '.4f'):>8} | "
-              f"{num(r['mtp_mean_err'], '.4f'):>12} | {pct(r['mean_coverage']):>7} | {pct(r['mtp_mean_coverage']):>11} | "
+              f"{num(r['mtp_mean_err'], '.4f'):>12} | {pct(r['mean_iou']):>7} | {pct(r['mtp_mean_iou']):>11} | "
               f"{num(r['success_rate'], '.1f'):>7}% | "
               f"{num(r['successes'], 'd'):>4} | {num(r['mtp_success_rate'], '.1f'):>11}% | "
               f"{num(r['mtp_successes'], 'd'):>8} | {r['best_seed'] or '-'}")
     print("-" * len(header))
     print("Mean err = mean final total error (position + orientation) of the policy rollouts; "
-          "Cov = mean final coverage of the goal T; best seed is chosen on the policy rollouts.")
+          "IoU = mean final intersection over union of the block T and the goal T; best seed is chosen on the policy rollouts.")
     print("Success rule: AND = pos_err < thr and ort_err < thr, SUM = pos_err + ort_err < thr "
           "(rates under different rules are not comparable).")
 
@@ -239,10 +239,10 @@ def main():
               "pos_err", "orient_err", "total_err")
     wb = Workbook()
     wb.remove(wb.active)
-    coverages = ("mean_coverage", "mtp_mean_coverage", "coverage")
-    add_sheet(wb, "Overview", overview, ("success_rate", "mtp_success_rate"), errors, coverages)
-    add_sheet(wb, "Per seed", per_seed, ("success_rate",), errors, coverages)
-    add_sheet(wb, "All rollouts", all_rollouts, (), errors, coverages)
+    ious = ("mean_iou", "mtp_mean_iou", "iou")
+    add_sheet(wb, "Overview", overview, ("success_rate", "mtp_success_rate"), errors, ious)
+    add_sheet(wb, "Per seed", per_seed, ("success_rate",), errors, ious)
+    add_sheet(wb, "All rollouts", all_rollouts, (), errors, ious)
     out_path = args.out_xlsx or args.paths[0] / OUT_NAME
     wb.save(out_path)
     print(f"\nSaved {out_path}")
