@@ -103,6 +103,11 @@ class TRIRL_PPO:
         self.w_disc_loss = config.algorithm.w_disc_loss
         self.target_momentum = config.algorithm.target_momentum
         self.prediction_steps = config.algorithm.prediction_steps
+        self.spr_learning_mode = config.algorithm.spr_learning_mode
+        if self.spr_learning_mode not in ["standard", "decaying", "freeze"]:
+            raise ValueError("spr_learning_mode is not configured correctly")
+
+        self.freeze_after_steps = self.total_timesteps // 3
 
         self.curriculum_success = config.environment.get("curriculum_success", False)
         if self.curriculum_success:
@@ -494,6 +499,13 @@ class TRIRL_PPO:
                     combined_learning_iteration_step = (multi_learning_iteration_step * self.nr_updates_per_multi_learning_iteration) + learning_iteration_step + 1
                     global_step = combined_learning_iteration_step * self.nr_steps * self.nr_envs
                     encoder_switch = jnp.where(global_step < self.warmup_env_steps, 0.0, 1.0)
+                    progress = jnp.clip(global_step / self.total_timesteps, 0.0, 1.0)
+                    if self.spr_learning_mode == "decaying":
+                        spr_scale = 1.0 - progress
+                    elif self.spr_learning_mode == "freeze":
+                        spr_scale = jnp.where(global_step < self.freeze_after_steps, 1.0, 0.0)
+                    else:
+                        spr_scale = 1.0
 
                     vmap_trirl_loss_fn = jax.vmap(trirl_loss_fn, in_axes=(None, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, None), out_axes=0)
                     safe_mean = lambda x: jnp.mean(x) if x is not None else x
@@ -508,7 +520,7 @@ class TRIRL_PPO:
 
                     def trirl_minibatch_update(carry, minibatch_indices_disc):
                         def ema(target_param, online_param):
-                            return self.target_momentum * target_param + (1 - self.target_momentum) * online_param
+                            return target_param + spr_scale * (1 - self.target_momentum) * (online_param - target_param)
 
                         discriminator_state, key = carry
 
@@ -531,11 +543,18 @@ class TRIRL_PPO:
                             batch_expert_absorbing[minibatch_indices_disc],
                             encoder_switch,
                         )
-
+                        old_params = discriminator_state.params
                         discriminator_state = discriminator_state.apply_gradients(grads=discriminator_gradients)
 
                         disc_params = dict(discriminator_state.params)
                         disc_params["params"] = dict(discriminator_state.params["params"])
+
+                        spr_online_modules = ("online_enc1", "online_enc_norm", "online_enc2", "online_enc3", "online_proj1", "online_proj_norm", "online_proj2","online_pred1", "online_pred_norm", "online_pred2")
+
+                        for name in spr_online_modules:
+                            disc_params["params"][name] = jax.tree_util.tree_map(
+                                lambda old, new: old + spr_scale * (new - old),
+                                old_params["params"][name], disc_params["params"][name])
 
                         disc_params["params"]["target_enc1"] = jax.tree_util.tree_map(ema, disc_params["params"]["target_enc1"], disc_params["params"]["online_enc1"])
                         disc_params["params"]["target_enc_norm"] = jax.tree_util.tree_map(ema, disc_params["params"]["target_enc_norm"], disc_params["params"]["online_enc_norm"])
@@ -764,6 +783,9 @@ class TRIRL_PPO:
                     combined_metrics = {**infos, **disc_optimization_metrics, **ppo_optimization_metrics}
                     if self.curriculum_success:
                         combined_metrics["env/success_threshold"] = env_state.success_threshold
+
+                    combined_metrics["env/spr_scale"] = spr_scale
+
                     combined_metrics = tree.map_structure(lambda x: jnp.mean(x), combined_metrics)
 
                     def callback(carry):

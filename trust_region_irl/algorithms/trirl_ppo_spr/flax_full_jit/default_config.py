@@ -45,6 +45,7 @@ def get_config(algorithm_name):
     config.warmup_env_steps = 0 # TRIRL steps during which the discriminator loss does not train the encoder
     config.w_disc_loss = 1.0
     config.prediction_steps = 1
+    config.spr_learning_mode = "standard" # "standard" | "decaying" | "freeze"
 
     config.handle_absorbing_states = True
     config.reward_type = 'byol-observation-based'
