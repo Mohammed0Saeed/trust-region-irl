@@ -278,9 +278,10 @@ class PushT:
         info = {
             "rollout/episode_return": 0.0,
             "rollout/episode_length": 0,
+            "rollout/is_success": 0.0,
             "env_info/pos_err": 0.0,
             "env_info/orient_err": 0.0,
-            "env_info/is_success": 0.0,
+            "env_info/success_step_rate": 0.0,
             "env_info/reward_dist": 0.0,
             "env_info/reward_orient": 0.0,
             "env_info/reward_ctrl": 0.0,
@@ -416,7 +417,7 @@ class PushT:
         state.info_episode_store["episode_length"] += 1
         next_observation = self.get_observation(obs_data)
         reward, r_info = self.get_reward(obs_data, action, state.success_threshold)
-        terminated = r_info["env_info/is_success"] > 0.5
+        terminated = r_info["env_info/success_step_rate"] > 0.5
         # divergence guard: block left a sane region (huge-finite) or state went
         # NaN -> end the episode so it resets instead of accumulating garbage.
         # (NaN > bound is False, so explicit isnan checks are needed; qvel/xpos can
@@ -438,6 +439,7 @@ class PushT:
         log_done = terminated | at_horizon
         state.info["rollout/episode_return"] = jnp.where(log_done, state.info_episode_store["episode_return"], state.info["rollout/episode_return"])
         state.info["rollout/episode_length"] = jnp.where(log_done, state.info_episode_store["episode_length"], state.info["rollout/episode_length"])
+        state.info["rollout/is_success"] = jnp.where(log_done, terminated.astype(jnp.float32), state.info["rollout/is_success"])
 
         def when_done(_):
             start_state = self._reset(state)
@@ -505,7 +507,7 @@ class PushT:
         info = {
             "env_info/pos_err": pos_err,
             "env_info/orient_err": orn_err,
-            "env_info/is_success": is_success,
+            "env_info/success_step_rate": is_success,
             "env_info/reward_dist": reward_dist,
             "env_info/reward_orient": reward_orient,
             "env_info/reward_ctrl": reward_ctrl,
