@@ -519,8 +519,10 @@ class TRIRL_PPO:
                     batch_indices_disc = batch_indices_disc.reshape((self.nr_epochs_disc * self.nr_minibatches, self.minibatch_size))
 
                     def trirl_minibatch_update(carry, minibatch_indices_disc):
+                        target_momentum = 1.0 - spr_scale * (1.0 - self.target_momentum)
+
                         def ema(target_param, online_param):
-                            return target_param + spr_scale * (1 - self.target_momentum) * (online_param - target_param)
+                            return target_momentum * target_param + (1 - target_momentum) * online_param
 
                         discriminator_state, key = carry
 
