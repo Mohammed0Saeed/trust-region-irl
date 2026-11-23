@@ -3,8 +3,11 @@
 2. Check the type of the encoder using script config ENCODER_TYPE = SPR | FEATURES
 3. Check the type of observation in the spr encoder using script config OBS_TYPE = TASK-BASED | JOINT-TASK-BASED
 
-Outputs go to OUTPUT_DIR/<EXPERIMENT_NAME>_<SUCCESS_MODE>/seed<N>/, one folder per training seed of the experiment,
-so evaluations of the same experiment with different success modes are kept apart.
+The checkpoints are read from runs/<PROJECT_NAME>/<EXPERIMENT_NAME>/<N>/models/latest.model.zip, one run per seed
+(PPO retraining: <N>_ppo_retraining/), see utils.py.
+
+Outputs go to OUTPUT_DIR/<PROJECT_NAME>/<EXPERIMENT_NAME>_<SUCCESS_MODE>/seed_<N>/, one folder per training seed of
+the experiment, so evaluations of the same experiment with different success modes are kept apart.
 """
 import argparse
 import json
@@ -25,7 +28,8 @@ DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parents[1] / "evaluations"  # expe
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("EXPERIMENT_NAME", type=str, help="Name of the experiment in wandb")
+    parser.add_argument("PROJECT_NAME", type=str, help="Project folder inside runs/ (e.g. spr_comparison)")
+    parser.add_argument("EXPERIMENT_NAME", type=str, help="Experiment folder inside the project (e.g. pusht_ppo_spr_K3)")
     parser.add_argument("CHECK_POINT_TYPE", type=str, choices=["RL-PPO", "TRIRL"], help="Type of the algorithm the checkpoint is trained on")
     parser.add_argument("ENCODER_TYPE", type=str, choices=["SPR", "FEATURES"], help="Type of the encoder trained on TRIRL")
     parser.add_argument("OBS_TYPE", type=str, choices=["TASK-BASED", "JOINT-TASK-BASED"], help="Type of the observations fed into SPR encoder")
@@ -41,23 +45,25 @@ def main():
     parallel_mtp = args.parallel_mtp == "true"
 
     # Settings of this evaluation, read by overall_evaluation.py (e.g. the algorithm type column)
-    experiment_dir = args.OUTPUT_DIR / f"{args.EXPERIMENT_NAME}_{args.success_mode}"
+    experiment_dir = args.OUTPUT_DIR / args.PROJECT_NAME / f"{args.EXPERIMENT_NAME}_{args.success_mode}"
     experiment_dir.mkdir(parents=True, exist_ok=True)
     with open(experiment_dir / "evaluation_info.json", "w") as f:
-        json.dump({"check_point_type": args.CHECK_POINT_TYPE, "encoder_type": args.ENCODER_TYPE,
+        json.dump({"project_name": args.PROJECT_NAME, "experiment_name": args.EXPERIMENT_NAME,
+                   "check_point_type": args.CHECK_POINT_TYPE, "encoder_type": args.ENCODER_TYPE,
                    "obs_type": args.OBS_TYPE, "seed": args.SEED, "success_threshold": args.SUCCESS_THRESHOLD,
                    "success_mode": args.success_mode,
                    "parallel_mtp": parallel_mtp}, f, indent=2)
 
     print(f"SUCCESS: {describe(args.success_mode, args.SUCCESS_THRESHOLD)}")
 
-    paths = find_checkpoints_paths(experiment_name=args.EXPERIMENT_NAME, check_point_type=args.CHECK_POINT_TYPE)
+    paths = find_checkpoints_paths(project_name=args.PROJECT_NAME, experiment_name=args.EXPERIMENT_NAME,
+                                   check_point_type=args.CHECK_POINT_TYPE)
     for path in paths:
         print("FOUND CHECKPOINT PATH: ", path)
 
-    for index, path in enumerate(paths):
-        # Build output dir, named after the training seed of the checkpoint
-        seed = seed_name(path, fallback=index)
+    for path in paths:
+        # Build output dir, named after the training seed of the checkpoint (seed_<N>)
+        seed = seed_name(path)
         output_dir = experiment_dir / seed
         output_dir.mkdir(parents=True, exist_ok=True)
 
