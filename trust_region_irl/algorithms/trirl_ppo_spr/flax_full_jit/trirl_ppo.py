@@ -545,6 +545,9 @@ class TRIRL_PPO:
                             batch_expert_absorbing[minibatch_indices_disc],
                             encoder_switch,
                         )
+
+                        online_step = spr_scale * (1.0 - self.target_momentum)
+
                         old_params = discriminator_state.params
                         discriminator_state = discriminator_state.apply_gradients(grads=discriminator_gradients)
 
@@ -555,7 +558,7 @@ class TRIRL_PPO:
 
                         for name in spr_online_modules:
                             disc_params["params"][name] = jax.tree_util.tree_map(
-                                lambda old, new: old + spr_scale * (new - old),
+                                lambda old, new: online_step * new + (1.0 - online_step) * old,
                                 old_params["params"][name], disc_params["params"][name])
 
                         disc_params["params"]["target_enc1"] = jax.tree_util.tree_map(ema, disc_params["params"]["target_enc1"], disc_params["params"]["online_enc1"])
