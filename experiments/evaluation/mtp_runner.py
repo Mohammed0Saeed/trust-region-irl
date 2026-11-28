@@ -7,9 +7,9 @@ The cost is -reward of the checkpoint:
     FEATURES  r = theta . phi(s), phi = pos_ort (2-D) or base_without_ctrl (3-D) features as in pusht_mjx,
               or the Boltzmann feature encoder for boltzmann-feature-based runs
 
-Every pose is rolled out once (controller seeded with `seed`), stopping early on success. Success uses the same
-rule as the policy rollouts (success.py: AND or SUM), with errors and IoU measured from the body frames of the
-block and the goal. The IoU is only recorded, it does not decide success.
+Every pose is rolled out once, its controller seeded with the seed the pose was drawn from, stopping early on
+success. Success uses the same rule as the policy rollouts (success.py: AND or SUM), with errors and IoU measured
+from the body frames of the block and the goal. The IoU is only recorded, it does not decide success.
 
 Outputs in output_dir:
     mtp_results.csv    final position / orientation error, IoU, success, status and steps of every pose
@@ -176,21 +176,20 @@ def stack_trees(trees):
     return jax.tree_util.tree_map(lambda *leaves: jnp.stack(leaves), *trees)
 
 
-def roll_out_poses_parallel(task, ctrl, batch_optimize, batch_get_action, poses, seed, success_threshold,
+def roll_out_poses_parallel(task, ctrl, batch_optimize, batch_get_action, poses, seeds, success_threshold,
                             success_mode="AND"):
     """MTP episodes from several block poses at once: one batched (vmapped) planner call per control step for
     all poses, the cheap CPU part (IK, gravity compensation, mj_step) per pose. Each pose gets the same reset,
     controller seed and success / stop rule as roll_out_pose; a pose that has finished is no longer stepped."""
     nr = len(poses)
     mj_datas, params = [], []
-    for pose in poses:
+    for pose, seed in zip(poses, seeds):
         x, y, angle = (float(v) for v in pose)
         task.det_init = {"block_pos_x": x, "block_pos_y": y, "block_angle": angle, "ee_goal_pos": list(EE_GOAL_POS)}
         mj_model, mj_data = task.reset(seed=seed)
         mujoco.mj_forward(mj_model, mj_data)
         mj_datas.append(mj_data)
         params.append(ctrl.init_params(seed))
-    ctrl.set_seed(seed)
     policy_params = stack_trees(params)
 
     sim_steps_per_replan = max(int((1.0 / PLANNING_FREQUENCY) / mj_model.opt.timestep), 1)
@@ -250,10 +249,11 @@ def roll_out_poses_parallel(task, ctrl, batch_optimize, batch_get_action, poses,
     return results
 
 
-def run_mtp(t_pos, checkpoint_path, encoder_type, obs_type, seed, success_threshold, output_dir, pose_indices=None,
+def run_mtp(t_pos, checkpoint_path, encoder_type, obs_type, seeds, success_threshold, output_dir, pose_indices=None,
             parallel=False, batch_size=MTP_BATCH_SIZE, success_mode="AND"):
     """Roll out MTP with the checkpoint's reward as cost from poses of t_pos ((nr, 3) [x, y, angle], world frame).
 
+    seeds: one seed per pose of t_pos (the poses seeds of rollout_policy); pose i's controller uses seeds[i].
     pose_indices: which poses of t_pos to run (0-based); None runs all of them.
     parallel: roll the poses out together, batch_size poses per batched planner call (lower it if the GPU runs out
               of memory); False rolls them out one after the other.
@@ -265,13 +265,16 @@ def run_mtp(t_pos, checkpoint_path, encoder_type, obs_type, seed, success_thresh
     if t_pos is None:
         t_pos = np.load(output_dir / "t_config.npy")
     t_pos = np.asarray(t_pos, dtype=np.float64)
+    seeds = [int(s) for s in seeds]
+    if len(seeds) != len(t_pos):
+        raise ValueError(f"{len(seeds)} seeds for {len(t_pos)} poses, expected one seed per pose")
     if pose_indices is None:
         pose_indices = range(len(t_pos))
     pose_indices = [int(i) for i in pose_indices]
 
     task = build_task(checkpoint_path)
     check_reward(task, encoder_type, obs_type)
-    ctrl = build_controller(task, seed)
+    ctrl = build_controller(task, seeds[0])  # the random key lives in the params (init_params(seed) per pose)
 
     results = []
     if parallel:
@@ -282,11 +285,12 @@ def run_mtp(t_pos, checkpoint_path, encoder_type, obs_type, seed, success_thresh
             chunk = pose_indices[chunk_start:chunk_start + batch_size]
             start = time.time()
             chunk_results = roll_out_poses_parallel(task, ctrl, batch_optimize, batch_get_action,
-                                                    t_pos[chunk], seed, success_threshold, success_mode)
+                                                    t_pos[chunk], [seeds[i] for i in chunk], success_threshold,
+                                                    success_mode)
             print(f"MTP poses {chunk[0] + 1}-{chunk[-1] + 1} in parallel ({time.time() - start:.1f} s)")
             for i, r in zip(chunk, chunk_results):
                 pose = t_pos[i]
-                r = {"pose": i + 1, "block_x_m": pose[0], "block_y_m": pose[1], "block_angle_rad": pose[2], **r}
+                r = {"pose": i + 1, "pose_seed": seeds[i], "block_x_m": pose[0], "block_y_m": pose[1], "block_angle_rad": pose[2], **r}
                 results.append(r)
                 print(f"MTP pose {i + 1}/{len(t_pos)}: pos {r['pos_err']:.3f} m, ort {r['orient_err']:.3f} rad, "
                       f"IoU {r['iou']:.2f}, {r['status']} after {r['steps']} steps")
@@ -296,9 +300,9 @@ def run_mtp(t_pos, checkpoint_path, encoder_type, obs_type, seed, success_thresh
     for i in pose_indices:
         pose = t_pos[i]
         start = time.time()
-        r = roll_out_pose(task, ctrl, jit_optimize, pose, seed, success_threshold, success_mode)
+        r = roll_out_pose(task, ctrl, jit_optimize, pose, seeds[i], success_threshold, success_mode)
         # "pose" is the 1-based row of t_config, so it matches the policy rollout from the same pose
-        r = {"pose": i + 1, "block_x_m": pose[0], "block_y_m": pose[1], "block_angle_rad": pose[2], **r}
+        r = {"pose": i + 1, "pose_seed": seeds[i], "block_x_m": pose[0], "block_y_m": pose[1], "block_angle_rad": pose[2], **r}
         results.append(r)
         print(f"MTP pose {i + 1}/{len(t_pos)}: pos {r['pos_err']:.3f} m, ort {r['orient_err']:.3f} rad, "
               f"IoU {r['iou']:.2f}, {r['status']} after {r['steps']} steps ({time.time() - start:.1f} s)")

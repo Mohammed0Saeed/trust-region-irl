@@ -1,16 +1,16 @@
 """Roll out the policy of a checkpoint from random T poses and save one video per rollout.
 
 The start poses are drawn by PushT itself (the same sampler as training with random_TPos: disk around the goal,
-any angle, clear of the end effector), from PRNG keys built from `seed`. The same seed therefore gives the same
-poses for every checkpoint and every experiment.
+any angle, clear of the end effector), one pose per seed of `seeds` from PRNGKey(seed). A seed therefore gives the
+same pose for every checkpoint and every experiment, whatever other seeds are evaluated with it.
 
 Rollouts use the deterministic policy (its mean). The scene lights are scaled up and every frame is
 gamma-corrected so the robot, the T and the goal are clearly visible.
 
 Outputs in output_dir:
-    rollout_<k>.mp4      one video per rollout (k = 1..nr_rollouts), captioned with its final error and status
-    initial_poses.csv    start pose [x, y, angle] of every rollout
-    t_config.npy         the same poses as a (nr_rollouts, 3) float array, loaded by MTP
+    rollout_<k>.mp4      one video per rollout (k = 1..len(seeds)), captioned with its final error and status
+    initial_poses.csv    seed and start pose [x, y, angle] of every rollout
+    t_config.npy         the same poses as a (len(seeds), 3) float array, loaded by MTP
     policy_results.csv   final position / orientation error, IoU, success, status and steps of every rollout
 
 A rollout stops at its first success under the chosen success mode (success.py: AND or SUM). The IoU of the
@@ -37,7 +37,6 @@ from trust_region_irl.algorithms.trirl_ppo_spr.flax_full_jit.policy import Polic
 from plot_rewards import load_checkpoint
 from success import describe, iou, is_success
 
-NR_ROLLOUTS = 10
 LIGHT_FACTOR = 2.5 # scale of the scene light intensities (> 1 brightens)
 GAMMA = 0.7 # gamma correction of the rendered pixels (< 1 brightens)
 CAMERA = "comparison"
@@ -47,9 +46,9 @@ CAPTION_HEIGHT = 44
 
 
 # ------------------------------------------------------------- start poses #
-def initial_states(env, seed, nr_rollouts):
-    """Reset nr_rollouts envs to random T poses drawn by PushT._reset from keys built from seed."""
-    keys = jax.random.split(jax.random.PRNGKey(seed), nr_rollouts)
+def initial_states(env, seeds):
+    """Reset one env per seed to a random T pose drawn by PushT._reset from PRNGKey(seed)."""
+    keys = jnp.stack([jax.random.PRNGKey(seed) for seed in seeds])
     return jax.vmap(lambda s: env._reset(s, force_random=True))(env.reset(keys, True))
 
 
@@ -153,12 +152,13 @@ def roll_out(env, step_fn, renderer, state, success_mode, success_threshold):
     return frames, results
 
 
-def rollout_policy(checkpoint_path, seed, success_threshold, output_dir, nr_rollouts=NR_ROLLOUTS, success_mode="AND"):
-    """Roll the checkpoint's policy out from nr_rollouts random T poses (drawn from seed), save one video each.
+def rollout_policy(checkpoint_path, seeds, success_threshold, output_dir, success_mode="AND"):
+    """Roll the checkpoint's policy out from one random T pose per seed of seeds, save one video each.
 
     success_mode / success_threshold: see success.py (AND or SUM).
-    Returns the (nr_rollouts, 3) start poses [x, y, angle], so the same poses can be reused (e.g. for MTP).
+    Returns the (len(seeds), 3) start poses [x, y, angle], so the same poses can be reused (e.g. for MTP).
     """
+    nr_rollouts = len(seeds)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -167,15 +167,15 @@ def rollout_policy(checkpoint_path, seed, success_threshold, output_dir, nr_roll
     # success is checked in roll_out with the chosen mode instead
     env = PushT(render=False, success_threshold=0.0)
 
-    start_state = initial_states(env, seed, nr_rollouts)
+    start_state = initial_states(env, seeds)
     poses = block_poses(start_state)
     poses_path = output_dir / "initial_poses.csv"
     with open(poses_path, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["rollout", "block_x_m", "block_y_m", "block_angle_rad"])
+        writer.writerow(["rollout", "pose_seed", "block_x_m", "block_y_m", "block_angle_rad"])
         for i, (x, y, angle) in enumerate(poses):
-            writer.writerow([i + 1, f"{x:.5f}", f"{y:.5f}", f"{angle:.5f}"])
-    print(f"Saved {poses_path} (seed {seed})")
+            writer.writerow([i + 1, seeds[i], f"{x:.5f}", f"{y:.5f}", f"{angle:.5f}"])
+    print(f"Saved {poses_path} (seeds {seeds})")
     # the same poses as an array, so MTP can load them directly: (nr_rollouts, 3) [x, y, angle] in the world frame
     t_config_path = output_dir / "t_config.npy"
     np.save(t_config_path, poses)
@@ -203,10 +203,10 @@ def rollout_policy(checkpoint_path, seed, success_threshold, output_dir, nr_roll
     results_path = output_dir / "policy_results.csv"
     with open(results_path, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["pose", "block_x_m", "block_y_m", "block_angle_rad", "pos_err", "orient_err", "iou",
+        writer.writerow(["pose", "pose_seed", "block_x_m", "block_y_m", "block_angle_rad", "pos_err", "orient_err", "iou",
                          "success", "status", "steps"])
         for i, (r, (x, y, angle)) in enumerate(zip(results, poses)):
-            writer.writerow([i + 1, x, y, angle, r["pos_err"], r["orient_err"], r["iou"],
+            writer.writerow([i + 1, seeds[i], x, y, angle, r["pos_err"], r["orient_err"], r["iou"],
                              int(r["status"] == "success"), r["status"], r["steps"]])
     print(f"Saved {results_path}")
 

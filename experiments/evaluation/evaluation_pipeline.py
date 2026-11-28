@@ -28,14 +28,14 @@ DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parents[1] / "evaluations"  # expe
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("PROJECT_NAME", type=str, help="Project folder inside runs/ (e.g. spr_comparison)")
-    parser.add_argument("EXPERIMENT_NAME", type=str, help="Experiment folder inside the project (e.g. pusht_ppo_spr_K3)")
-    parser.add_argument("CHECK_POINT_TYPE", type=str, choices=["RL-PPO", "TRIRL"], help="Type of the algorithm the checkpoint is trained on")
-    parser.add_argument("ENCODER_TYPE", type=str, choices=["SPR", "FEATURES"], help="Type of the encoder trained on TRIRL")
-    parser.add_argument("OBS_TYPE", type=str, choices=["TASK-BASED", "JOINT-TASK-BASED"], help="Type of the observations fed into SPR encoder")
-    parser.add_argument("SEED", type=int, help="Seed for the random T configuration generator")
-    parser.add_argument("SUCCESS_THRESHOLD", type=float, help="Threshold to determine if a policy is successful")
-    parser.add_argument("OUTPUT_DIR", type=Path, nargs="?", default=DEFAULT_OUTPUT_DIR, help="Path to the output directory")
+    parser.add_argument("--project-name", type=str, required=True, help="Project folder inside runs/ (e.g. spr_comparison)")
+    parser.add_argument("--experiment-name", type=str, required=True, help="Experiment folder inside the project (e.g. pusht_ppo_spr_K3)")
+    parser.add_argument("--check-point-type", type=str, required=True, choices=["RL-PPO", "TRIRL"], help="Type of the algorithm the checkpoint is trained on")
+    parser.add_argument("--encoder-type", type=str, required=True, choices=["SPR", "FEATURES"], help="Type of the encoder trained on TRIRL")
+    parser.add_argument("--obs-type", type=str, required=True, choices=["TASK-BASED", "JOINT-TASK-BASED"], help="Type of the observations fed into SPR encoder")
+    parser.add_argument("--poses-seeds", type=str, required=True, help="Comma-separated seeds for the random T configurations (e.g. 0,1,2)")
+    parser.add_argument("--success-threshold", type=float, required=True, help="Threshold to determine if a policy is successful")
+    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR, help="Path to the output directory")
     parser.add_argument("--success-mode", type=str, default="AND", choices=list(SUCCESS_MODES),
                         help="AND: pos_err < thr and ort_err < thr; SUM: pos_err + ort_err < thr "
                              "(the IoU with the goal T is always recorded, but never decides success)")
@@ -44,20 +44,22 @@ def main():
     args = parser.parse_args()
     parallel_mtp = args.parallel_mtp == "true"
 
+    evaluation_seeds = [int(i) for i in args.poses_seeds.split(",")]
+
     # Settings of this evaluation, read by overall_evaluation.py (e.g. the algorithm type column)
-    experiment_dir = args.OUTPUT_DIR / args.PROJECT_NAME / f"{args.EXPERIMENT_NAME}_{args.success_mode}"
+    experiment_dir = args.output_dir / args.project_name / f"{args.experiment_name}_{args.success_mode}"
     experiment_dir.mkdir(parents=True, exist_ok=True)
     with open(experiment_dir / "evaluation_info.json", "w") as f:
-        json.dump({"project_name": args.PROJECT_NAME, "experiment_name": args.EXPERIMENT_NAME,
-                   "check_point_type": args.CHECK_POINT_TYPE, "encoder_type": args.ENCODER_TYPE,
-                   "obs_type": args.OBS_TYPE, "seed": args.SEED, "success_threshold": args.SUCCESS_THRESHOLD,
+        json.dump({"project_name": args.project_name, "experiment_name": args.experiment_name,
+                   "check_point_type": args.check_point_type, "encoder_type": args.encoder_type,
+                   "obs_type": args.obs_type, "poses_seeds": evaluation_seeds, "success_threshold": args.success_threshold,
                    "success_mode": args.success_mode,
                    "parallel_mtp": parallel_mtp}, f, indent=2)
 
-    print(f"SUCCESS: {describe(args.success_mode, args.SUCCESS_THRESHOLD)}")
+    print(f"SUCCESS: {describe(args.success_mode, args.success_threshold)}")
 
-    paths = find_checkpoints_paths(project_name=args.PROJECT_NAME, experiment_name=args.EXPERIMENT_NAME,
-                                   check_point_type=args.CHECK_POINT_TYPE)
+    paths = find_checkpoints_paths(project_name=args.project_name, experiment_name=args.experiment_name,
+                                   check_point_type=args.check_point_type)
     for path in paths:
         print("FOUND CHECKPOINT PATH: ", path)
 
@@ -68,22 +70,22 @@ def main():
         output_dir.mkdir(parents=True, exist_ok=True)
 
         # Plot the rewards based on ENCODER_TYPE and OBS_TYPE
-        if args.CHECK_POINT_TYPE == "TRIRL":
-            print(f"PLOTTING REWARD {args.EXPERIMENT_NAME}_{seed}")
-            plot_reward(args.CHECK_POINT_TYPE, args.ENCODER_TYPE, args.OBS_TYPE, checkpoint_path=path, output_dir=output_dir)
+        if args.check_point_type == "TRIRL":
+            print(f"PLOTTING REWARD {args.experiment_name}_{seed}")
+            plot_reward(args.check_point_type, args.encoder_type, args.obs_type, checkpoint_path=path, output_dir=output_dir)
 
-        # Roll out the policy and save the videos, use the seed in the configuration for the keys
-        print(f"ROLLING OUT POLICY {args.EXPERIMENT_NAME}_{seed}")
-        t_config = rollout_policy(path, seed=args.SEED, success_threshold=args.SUCCESS_THRESHOLD, output_dir=output_dir,
+        # Roll out the policy from one pose per poses seed and save the videos
+        print(f"ROLLING OUT POLICY {args.experiment_name}_{seed}")
+        t_config = rollout_policy(path, seeds=evaluation_seeds, success_threshold=args.success_threshold, output_dir=output_dir,
                                   success_mode=args.success_mode)
 
         # Using the same T configs, run MTP and set the cost function to be the reward function if CHECK_POINT_TYPE = TRIRL.
-        # Every seed's reward is rolled out from all poses of t_config (the same 10 random poses as the policy).
-        if args.CHECK_POINT_TYPE == "TRIRL":
-            print(f"RUNNING MTP {args.EXPERIMENT_NAME}_{seed} FROM {len(t_config)} POSES"
+        # Every seed's reward is rolled out from all poses of t_config (the same poses as the policy, one per poses seed).
+        if args.check_point_type == "TRIRL":
+            print(f"RUNNING MTP {args.experiment_name}_{seed} FROM {len(t_config)} POSES"
                   f"{' IN PARALLEL' if parallel_mtp else ''}")
-            run_mtp(t_config, checkpoint_path=path, encoder_type=args.ENCODER_TYPE, obs_type=args.OBS_TYPE,
-                    seed=args.SEED, success_threshold=args.SUCCESS_THRESHOLD, output_dir=output_dir,
+            run_mtp(t_config, checkpoint_path=path, encoder_type=args.encoder_type, obs_type=args.obs_type,
+                    seeds=evaluation_seeds, success_threshold=args.success_threshold, output_dir=output_dir,
                     parallel=parallel_mtp, success_mode=args.success_mode)
 
 
